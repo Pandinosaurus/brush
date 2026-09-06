@@ -3,8 +3,8 @@ pub mod pinhole;
 pub mod radial_tangential_8;
 pub mod thin_prism_fisheye;
 
-use burn_cubecl::cubecl;
-use burn_cubecl::cubecl::prelude::*;
+use burn::cubecl;
+use burn::cubecl::prelude::*;
 
 use crate::kernels::camera_model::CameraModel::{
     KannalaBrandt4, Pinhole, RadialTangential8, ThinPrismFisheye,
@@ -125,7 +125,7 @@ pub fn calculate_projection_vjp(
 }
 
 impl JacobianClampLimits {
-    pub fn to_launch_object<R: Runtime>(&self) -> JacobianClampLimitsLaunch<R> {
+    pub fn to_launch_object(&self) -> JacobianClampLimitsLaunch {
         JacobianClampLimitsLaunch::new(
             self.lim_pos_x,
             self.lim_pos_y,

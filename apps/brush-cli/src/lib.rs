@@ -113,6 +113,8 @@ pub async fn run_cli_ui(
         multi
     };
 
+    log::info!("Compute backend: {:?}", process.device);
+
     let main_spinner = ProgressBar::new_spinner().with_style(
         ProgressStyle::with_template("{spinner:.blue} {msg}")
             .expect("Invalid indacitif config")

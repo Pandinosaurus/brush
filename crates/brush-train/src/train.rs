@@ -15,7 +15,6 @@ use brush_render::bwd::render_splats;
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use burn::{
-    backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
     module::{AutodiffModule, Param},
     tensor::{
         Bool, Device, Distribution, Gradients, IndexingUpdateOp, Int, Tensor, TensorData,
@@ -23,7 +22,6 @@ use burn::{
     },
 };
 
-use burn_cubecl::cubecl::Runtime;
 use hashbrown::HashSet;
 use tracing::{Instrument, trace_span};
 
@@ -130,7 +128,7 @@ pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
         .into_data_async()
         .await
         .expect("Failed to fetch splat data")
-        .to_vec()
+        .try_to_vec()
         .expect("Failed to get means");
     bounds_from_pos(percentile, &means)
 }
@@ -279,22 +277,15 @@ impl SplatTrainer {
 
             trace_span!("Housekeeping").in_scope(|| {
                 // Refine state accumulates on the inner (non-autodiff) device
-                // so we can mix it with `.inner()`-stripped gradients/aux
-                // without crossing backends. `detach_autodiff` also clears
-                // the residual `checkpointing` flag that bare `.inner()`
-                // leaves behind (see `brush_render::burn_glue`).
-                use brush_render::burn_glue::detach_autodiff;
                 let refine_weight = refine_weight_holder
                     .grad_remove(&mut grads)
-                    .expect("XY gradients need to be calculated.");
+                    .expect("XY gradients need to be calculated.")
+                    .without_autodiff();
                 let device = splats.device().inner();
                 let record = self
                     .refine_record
                     .get_or_insert_with(|| RefineRecord::new(splats.num_splats(), &device));
-                // `visible` / `max_radius` already arrive on the inner backend;
-                // only the freshly-extracted `refine_weight` gradient needs the
-                // autodiff stripped off.
-                record.gather_stats(detach_autodiff(refine_weight), visible.clone(), max_radius);
+                record.gather_stats(refine_weight, visible.clone(), max_radius);
             });
 
             (grads, visible, diff_out.num_visible, loss_inner)
@@ -436,8 +427,10 @@ impl SplatTrainer {
         // floor is attached at the end (below), once positions/count are known.
         let splats = splats.bake_min_scale();
         let device = splats.device();
-        // `memory_cleanup` lives on the wgpu client, not on `Device`.
-        let client = WgpuRuntime::<AutoCompiler>::client(&WgpuDevice::default());
+        let client = match device.as_dispatch() {
+            burn::backend::DispatchDevice::Cube(d) => Some(d.client()),
+            burn::backend::DispatchDevice::Autodiff(_) => None,
+        };
 
         let refiner = self
             .refine_record
@@ -453,7 +446,7 @@ impl SplatTrainer {
             .into_data_async()
             .await
             .expect("Failed to read screen size")
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .expect("Failed to read screen size vec");
         if !ss_data.is_empty() {
             let mut sorted: Vec<f32> = ss_data.iter().copied().filter(|v| v.is_finite()).collect();
@@ -547,7 +540,7 @@ impl SplatTrainer {
                 .into_data_async()
                 .await
                 .expect("Failed to get weights")
-                .into_vec::<f32>()
+                .try_into_vec::<f32>()
                 .expect("Failed to read weights");
             let resampled_inds = multinomial_sample(&resampled_weights, pruned_count);
             split_inds.extend(resampled_inds);
@@ -567,7 +560,7 @@ impl SplatTrainer {
                     .into_data_async()
                     .await
                     .expect("Failed to get oversized indices")
-                    .into_vec::<i32>()
+                    .try_into_vec::<i32>()
                     .expect("Failed to read oversized indices");
                 let mut budget = self
                     .config
@@ -616,7 +609,7 @@ impl SplatTrainer {
                     .into_data_async()
                     .await
                     .expect("Failed to get weights")
-                    .into_vec::<f32>()
+                    .try_into_vec::<f32>()
                     .expect("Failed to read weights");
                 let growth_inds = multinomial_sample(&weights, grow_count);
                 split_inds.extend(growth_inds);
@@ -632,7 +625,9 @@ impl SplatTrainer {
 
         // Update current bounds based on the splats.
         self.bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
-        client.memory_cleanup();
+        if let Some(client) = &client {
+            client.memory_cleanup();
+        }
 
         // Recompute the per-splat 3D-filter floor against the new positions/
         // count and attach it — the floor is part of the splat from here until
@@ -873,10 +868,7 @@ async fn prune_points(
     let new_points = valid_inds.dims()[0] as u32;
     if new_points < start_splats {
         let valid_inds = valid_inds.squeeze_dim(1);
-        // Splat params + optimizer state share the autodiff device, but the
-        // refiner runs on the inner device — give `keep()` an inner copy.
-        use brush_render::burn_glue::detach_autodiff_int;
-        let inner_valid_inds = detach_autodiff_int(valid_inds.clone().inner());
+        let inner_valid_inds = valid_inds.clone().without_autodiff();
         splats = map_splats_and_opt(
             splats,
             optim,

@@ -1,8 +1,7 @@
 #![recursion_limit = "256"]
 
-use brush_cube::MainBackend as Wgpu;
+use burn::backend::Backend;
 use burn::backend::tensor::FloatTensor;
-use burn::backend::{Autodiff, Backend};
 use camera::Camera;
 use clap::ValueEnum;
 use glam::Vec3;
@@ -33,13 +32,10 @@ pub mod get_tile_offset;
 pub mod render;
 pub mod validation;
 
-/// `DispatchTensorKind` variant for the active wgpu backend. burn-dispatch
-/// uses different variant names per backend; brush only ever runs on the
-/// `WebGpu` variant, so this macro hides the variant name from match arms.
-macro_rules! wgpu_kind {
-    ($($t:tt)*) => { ::burn::backend::DispatchTensorKind::Wgpu($($t)*) };
+macro_rules! backend_kind {
+    ($($t:tt)*) => { ::burn::backend::DispatchTensorKind::Cube($($t)*) };
 }
-pub(crate) use wgpu_kind;
+pub(crate) use backend_kind;
 
 /// Trait for the gaussian splatting rendering pipeline.
 ///
@@ -51,7 +47,7 @@ pub(crate) use wgpu_kind;
 /// the `RenderOutput` via its `ExtensionType` derive. Only the non-autodiff
 /// arm is generated: the differentiable path is a hand-rolled `Backward` in
 /// `brush-render-bwd` and never dispatches `render` through `Autodiff`.
-#[burn::backend::backend_extension(Wgpu, Autodiff)]
+#[burn::backend::backend_extension(Cube, Autodiff)]
 pub trait SplatOps: Backend {
     /// Render gaussian splats to an image.
     ///
