@@ -1,339 +1,497 @@
+use std::f32::consts::FRAC_1_SQRT_2;
+
 use crate::{
-    adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
+    adam_scaled::{AdamScaled, AdamState},
     config::TrainConfig,
     msg::{RefineStats, TrainStepStats},
     multinomial::multinomial_sample,
     quat_vec::quaternion_vec_multiply,
-    ssim::Ssim,
+    splat_init::bounds_from_pos,
     stats::RefineRecord,
 };
-
-use brush_dataset::{config::AlphaMode, scene::SceneBatch};
-use brush_render::{MainBackend, gaussian_splats::Splats};
-use brush_render::{bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
-use brush_render_bwd::burn_glue::SplatForwardDiff;
+use brush_dataset::scene::SceneBatch;
+use brush_loss::{ImageLossConfig, image_loss};
+use brush_render::bwd::render_splats;
+use brush_render::gaussian_splats::Splats;
+use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use burn::{
-    backend::{
-        Autodiff,
-        wgpu::{WgpuDevice, WgpuRuntime},
-    },
-    lr_scheduler::{
-        LrScheduler,
-        exponential::{ExponentialLrScheduler, ExponentialLrSchedulerConfig},
-    },
-    module::ParamId,
-    optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor, record::AdaptorRecord},
-    prelude::Backend,
+    module::{AutodiffModule, Param},
     tensor::{
-        Bool, Distribution, IndexingUpdateOp, Tensor, TensorData, TensorPrimitive,
-        activation::sigmoid, backend::AutodiffBackend, s,
+        Bool, Device, Distribution, Gradients, IndexingUpdateOp, Int, Tensor, TensorData,
+        activation::sigmoid, s,
     },
 };
 
-use burn_cubecl::cubecl::Runtime;
-use glam::Vec3;
-use hashbrown::{HashMap, HashSet};
-use tracing::trace_span;
+use hashbrown::HashSet;
+use tracing::{Instrument, trace_span};
+
+pub const BOUND_PERCENTILE: f32 = 0.8;
 
 const MIN_OPACITY: f32 = 1.0 / 255.0;
-const BOUND_PERCENTILE: f32 = 0.8;
 
-type DiffBackend = Autodiff<MainBackend>;
-type OptimizerType = OptimizerAdaptor<AdamScaled, Splats<DiffBackend>, DiffBackend>;
+/// Fraction of training after which the Mip-Splatting 3D-filter floor stops
+/// being recomputed and is held frozen (still applied), so splats settle
+/// against a fixed target instead of chasing a moving floor.
+const MIN_SCALE_FREEZE_FRAC: f32 = 0.9;
+
+/// Mip-Splatting 3D-filter strength (the paper's `s`): each splat gets a frozen
+/// per-splat world-space scale floor `f = sqrt(MIN_SCALE_FACTOR) · pixel size at
+/// the nearest observing camera`, i.e. a ~0.32px std-dev floor. Folded into
+/// scales/opacity at render (and baked at export), never optimized. Fundamental
+/// to well-behaved splats, so not a tunable.
+const MIN_SCALE_FACTOR: f32 = 0.1;
+
+/// The three per-parameter Adam states of a [`Splats`] module, owned directly
+/// so the trainer can update LR scaling every step and surgically edit the
+/// momentum tensors during refine — all GPU-side, no record round-trips.
+struct SplatOptim {
+    adam: AdamScaled,
+    transforms: AdamState<2>,
+    sh_coeffs: AdamState<3>,
+    opacities: AdamState<1>,
+}
+
+/// Step one parameter: pull its gradient, run Adam on the inner
+/// (autodiff-free) tensor, and re-wrap tracking. Parameters without a
+/// gradient this step are left untouched.
+fn step_param<const D: usize>(
+    adam: &AdamScaled,
+    lr: f64,
+    param: Param<Tensor<D>>,
+    state: &mut AdamState<D>,
+    grads: &mut Gradients,
+) -> Param<Tensor<D>> {
+    param.map(|t| {
+        let Some(grad) = t.grad_remove(grads) else {
+            return t;
+        };
+        let stepped = adam.step(lr, t.inner(), &grad, state);
+        Tensor::from_inner(stepped).require_grad()
+    })
+}
 
 pub struct SplatTrainer {
     config: TrainConfig,
-    sched_mean: ExponentialLrScheduler,
-    sched_scale: ExponentialLrScheduler,
-    refine_record: Option<RefineRecord<MainBackend>>,
-    optim: Option<OptimizerType>,
-
-    ssim: Option<Ssim<DiffBackend>>,
-
+    /// Per-step multiplier of the exponential mean-LR schedule:
+    /// `lr(n) = lr_mean * decay^(n-1)`.
+    lr_mean_decay: f64,
+    refine_record: Option<RefineRecord>,
+    optim: Option<SplatOptim>,
+    ssim_enabled: bool,
     bounds: BoundingBox,
-
+    step_count: u32,
+    max_sh_degree: u32,
+    /// Per-train-view (world center, focal in px at native res) for the
+    /// Mip-Splatting 3D filter. Empty disables it. The floor itself lives on
+    /// the splats (recomputed at each refine), not here.
+    view_cams: Vec<(glam::Vec3, f32)>,
     #[cfg(not(target_family = "wasm"))]
-    lpips: Option<lpips::LpipsModel<DiffBackend>>,
+    lpips: Option<lpips::LpipsModel>,
 }
 
-fn inv_sigmoid<B: Backend>(x: Tensor<B, 1>) -> Tensor<B, 1> {
+fn inv_sigmoid(x: Tensor<1>) -> Tensor<1> {
     (x.clone() / (1.0f32 - x)).log()
 }
 
-fn create_default_optimizer() -> OptimizerType {
-    AdamScaledConfig::new().with_epsilon(1e-15).init()
+/// Per-splat world-space scale floor for the Mip-Splatting 3D filter:
+/// `f_i = sqrt(factor) · min_v(||mean_i - cam_v|| / focal_px_v)`. `means` and
+/// the result are on the inner (non-autodiff) backend; `f` is a frozen
+/// constant. Returns `None` if disabled or there are no cameras.
+fn compute_min_scale(
+    means: &Tensor<2>,
+    view_cams: &[(glam::Vec3, f32)],
+    factor: f32,
+) -> Option<Tensor<1>> {
+    if factor <= 0.0 || view_cams.is_empty() {
+        return None;
+    }
+    let device = means.device();
+    let n = means.dims()[0] as i32;
+
+    let mut min_ratio: Option<Tensor<1>> = None;
+    for (center, focal) in view_cams {
+        let c = Tensor::<1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
+        let diff = means.clone() - c;
+        let dist = diff.clone().mul(diff).sum_dim(1).sqrt().reshape([n]);
+        let ratio = dist.div_scalar(focal.max(1e-6));
+        min_ratio = Some(match min_ratio {
+            Some(m) => m.min_pair(ratio),
+            None => ratio,
+        });
+    }
+    min_ratio.map(|r| r.mul_scalar(factor.sqrt()))
+}
+
+pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
+    let means: Vec<f32> = splats
+        .means()
+        .into_data_async()
+        .await
+        .expect("Failed to fetch splat data")
+        .try_to_vec()
+        .expect("Failed to get means");
+    bounds_from_pos(percentile, &means)
 }
 
 impl SplatTrainer {
-    pub async fn new<B: Backend>(
-        config: &TrainConfig,
-        device: &WgpuDevice,
-        init_splats: Splats<B>,
-    ) -> Self {
-        let decay = (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_steps as f64);
-        let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
+    #[allow(unused_variables)]
+    pub fn new(config: &TrainConfig, device: &Device, bounds: BoundingBox) -> Self {
+        let decay =
+            (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
 
-        let decay = (config.lr_scale_end / config.lr_scale).powf(1.0 / config.total_steps as f64);
-        let lr_scale = ExponentialLrSchedulerConfig::new(config.lr_scale, decay);
+        let ssim_enabled = config.ssim_weight > 0.0;
 
-        const SSIM_WINDOW_SIZE: usize = 11; // Could be configurable but meh, rather keep consistent.
-        let ssim = (config.ssim_weight > 0.0).then(|| Ssim::new(SSIM_WINDOW_SIZE, 3, device));
+        // Growth is gated on the global iter. LOD phases run past
+        // total_train_iters but their refines should never grow — clamp
+        // here so growth_stop is never effectively past end-of-training.
+        let mut config = config.clone();
+        config.growth_stop_iter = config.growth_stop_iter.min(config.total_train_iters);
 
-        let bounds = init_splats.get_bounds(BOUND_PERCENTILE).await;
+        #[cfg(not(target_family = "wasm"))]
+        let lpips = (config.lpips_loss_weight > 0.0).then(|| lpips::load_vgg_lpips(device));
 
         Self {
-            config: config.clone(),
-            sched_mean: lr_mean.init().expect("Mean lr schedule must be valid."),
-            sched_scale: lr_scale.init().expect("Scale lr schedule must be valid."),
+            config,
+            lr_mean_decay: decay,
             optim: None,
             refine_record: None,
-            ssim,
+            ssim_enabled,
             bounds,
+            step_count: 0,
+            max_sh_degree: 0,
+            view_cams: Vec::new(),
             #[cfg(not(target_family = "wasm"))]
-            lpips: (config.lpips_loss_weight > 0.0).then(|| lpips::load_vgg_lpips(device)),
+            lpips,
         }
     }
 
-    pub fn step(
-        &mut self,
-        batch: SceneBatch,
-        splats: Splats<DiffBackend>,
-    ) -> (Splats<DiffBackend>, TrainStepStats<MainBackend>) {
-        let _span = trace_span!("Train step").entered();
+    /// Supply per-train-view (world center, focal-px at native res) to enable
+    /// the Mip-Splatting 3D filter (gated on `config.min_scale_factor > 0`).
+    pub fn set_view_cams(&mut self, view_cams: Vec<(glam::Vec3, f32)>) {
+        self.view_cams = view_cams;
+    }
 
+    pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
         let mut splats = splats;
 
-        let [img_h, img_w, _] = batch.img_tensor.shape.clone().try_into().unwrap();
-        let camera = &batch.camera;
+        // Track max SH degree from the first splats we see.
+        if self.step_count == 0 {
+            self.max_sh_degree = splats.sh_degree();
+        }
+        self.step_count += 1;
 
-        // Upload tensor early.
+        let [img_h, img_w] = batch.img_size();
+        let camera = batch.camera;
+
         let device = splats.device();
-        let has_alpha = batch.has_alpha();
-        let gt_tensor = Tensor::from_data(batch.img_tensor, &device);
-
-        let (pred_image, aux, refine_weight_holder) = trace_span!("Forward").in_scope(|| {
-            // Could generate a random background color, but so far
-            // results just seem worse.
-            let background = Vec3::ZERO;
-
-            let diff_out = <DiffBackend as SplatForwardDiff<_>>::render_splats(
-                camera,
-                glam::uvec2(img_w as u32, img_h as u32),
-                splats.means.val().into_primitive().tensor(),
-                splats.log_scales.val().into_primitive().tensor(),
-                splats.rotations.val().into_primitive().tensor(),
-                splats.sh_coeffs.val().into_primitive().tensor(),
-                splats.raw_opacities.val().into_primitive().tensor(),
-                background,
-            );
-
-            let img = Tensor::from_primitive(TensorPrimitive::Float(diff_out.img));
-
-            #[cfg(any(feature = "debug-validation", test))]
-            {
-                splats.validate_values();
-                diff_out.aux.validate_values();
-            }
-
-            (img, diff_out.aux, diff_out.refine_weight_holder)
-        });
+        let has_alpha = batch.has_alpha;
+        // GT lives on the GPU as packed `[H, W]` u32 (RGBA u8). All mixing
+        // (bg compositing, alpha matching, mask) is folded into the loss
+        // kernels; no f32 GT image is ever materialised here.
+        // GT is pure data — never differentiated. Build it on the inner
+        // backend so it doesn't inherit the autodiff device's residual
+        // checkpointing flag (the LPIPS `unpack_gt_rgb` path, via
+        // `unwrap_wgpu_int`, expects a clean Wgpu tensor).
+        let gt_packed: Tensor<2, Int> =
+            Tensor::from_data(batch.img_packed, &device.clone().inner());
+        let img_size = glam::uvec2(img_w as u32, img_h as u32);
+        let base = &self.config.background_color;
+        let base_bg = glam::Vec3::new(base[0], base[1], base[2]);
+        let background = sample_background_color(base_bg, self.config.background_noise_strength);
 
         let median_scale = self.bounds.median_size();
-        let num_visible = aux.num_visible().inner();
-        let num_intersections = aux.num_intersections().inner();
-        let pred_rgb = pred_image.clone().slice(s![.., .., 0..3]);
-        let gt_rgb = gt_tensor.clone().slice(s![.., .., 0..3]);
 
-        let visible: Tensor<Autodiff<MainBackend>, 1> =
-            Tensor::from_primitive(TensorPrimitive::Float(aux.visible));
+        let (mut grads, visible, num_visible, loss_inner) = {
+            // The splats already carry their 3D-filter floor (set at refine);
+            // the render path folds it in. Optimizer/refine work on raw params.
+            let render_input = splats.clone();
+            let diff_out = render_splats(render_input, &camera, img_size, background)
+                .instrument(trace_span!("Forward"))
+                .await;
 
-        let loss = trace_span!("Calculate losses").in_scope(|| {
-            let l1_rgb = (pred_rgb.clone() - gt_rgb.clone()).abs();
+            let pred_image = diff_out.img;
+            let refine_weight_holder = diff_out.refine_weight_holder;
+            let visible = diff_out.visible;
+            let max_radius = diff_out.max_radius;
 
-            let total_err = if let Some(ssim) = &self.ssim {
-                let ssim_err = ssim.ssim(pred_rgb.clone(), gt_rgb.clone());
-                l1_rgb * (1.0 - self.config.ssim_weight) - (ssim_err * self.config.ssim_weight)
+            // RGB loss is `(1 - w) * L1 + (-w) * SSIM` per pixel. Bg
+            // compositing always runs in the kernel; for synthesised opaque
+            // alpha or zero bg it's a no-op. Mask multiplies the loss-map
+            // by `gt.a`; for synthesised opaque alpha that's a no-op too.
+            // Alpha matching needs a real alpha source (synthesised
+            // a = 1 would pull predicted alpha to fully opaque); we feed
+            // `pred` with 4 channels and the kernel's `c == 3` workgroup
+            // emits `|pred.a - gt.a|` into the alpha channel.
+            let masked_alpha = batch.alpha_mode == AlphaMode::Masked;
+            let (l1_w, ssim_w) = if self.ssim_enabled {
+                (1.0 - self.config.ssim_weight, -self.config.ssim_weight)
             } else {
-                l1_rgb
+                (1.0, 0.0)
+            };
+            let do_alpha_match = has_alpha && !masked_alpha && self.config.match_alpha_weight > 0.0;
+            // Only composite when there's a real alpha channel and a non-zero
+            // bg to mix in; the kernel skips the per-pixel `(1-a)*bg` math
+            // entirely when this is None.
+            let composite_bg = (has_alpha && background != glam::Vec3::ZERO).then_some(background);
+            let cfg = ImageLossConfig {
+                l1_weight: l1_w,
+                ssim_weight: ssim_w,
+                composite_bg,
+                mask: masked_alpha,
+            };
+            let pred_for_loss = if do_alpha_match {
+                pred_image.clone()
+            } else {
+                pred_image.clone().slice(s![.., .., 0..3])
+            };
+            let loss_map = image_loss(pred_for_loss, gt_packed.clone(), cfg);
+
+            // `loss` is only reassigned by the LPIPS path below, which is
+            // compiled out on wasm — so `mut` is unused there.
+            #[cfg_attr(target_family = "wasm", allow(unused_mut))]
+            let mut loss = if do_alpha_match {
+                let rgb = loss_map.clone().slice(s![.., .., 0..3]).mean();
+                let alpha = loss_map.slice(s![.., .., 3..4]).mean();
+                rgb + alpha * self.config.match_alpha_weight
+            } else {
+                loss_map.mean()
             };
 
-            let total_err = if has_alpha {
-                let alpha_input = gt_tensor.clone().slice(s![.., .., 3..4]);
-
-                if batch.alpha_mode == AlphaMode::Masked {
-                    total_err * alpha_input
-                } else {
-                    let pred_alpha = pred_image.clone().slice(s![.., .., 3..4]);
-                    total_err + (alpha_input - pred_alpha).abs() * self.config.match_alpha_weight
-                }
-            } else {
-                total_err
-            };
-
-            let loss = total_err.mean();
-
-            // TODO: Support masked lpips.
+            // LPIPS still needs an f32 RGB tensor for VGG. Materialising it
+            // here costs ~99 MB at 4K, only when LPIPS is enabled.
             #[cfg(not(target_family = "wasm"))]
-            let loss = if let Some(lpips) = &self.lpips {
-                loss + lpips.lpips(pred_rgb.unsqueeze_dim(0), gt_rgb.unsqueeze_dim(0))
-                    * self.config.lpips_loss_weight
-            } else {
-                loss
-            };
+            if let Some(lpips) = &self.lpips {
+                let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
+                let gt_rgb_diff: Tensor<3> = Tensor::from_inner(gt_rgb);
+                loss = loss
+                    + lpips.lpips(
+                        pred_image.clone().slice(s![.., .., 0..3]).unsqueeze_dim(0),
+                        gt_rgb_diff.unsqueeze_dim(0),
+                    ) * self.config.lpips_loss_weight;
+            }
 
-            loss
-        });
+            // Strip the autodiff graph off the loss so consumers can read the
+            // scalar later without keeping the backward pass alive.
+            let loss_inner = loss.clone().inner();
+            let mut grads = splats.bwd_validate(loss).await;
 
-        let mut grads = trace_span!("Backward pass").in_scope(|| loss.backward());
+            trace_span!("Housekeeping").in_scope(|| {
+                // Refine state accumulates on the inner (non-autodiff) device
+                let refine_weight = refine_weight_holder
+                    .grad_remove(&mut grads)
+                    .expect("XY gradients need to be calculated.")
+                    .without_autodiff();
+                let device = splats.device().inner();
+                let record = self
+                    .refine_record
+                    .get_or_insert_with(|| RefineRecord::new(splats.num_splats(), &device));
+                record.gather_stats(refine_weight, visible.clone(), max_radius);
+            });
 
-        #[cfg(any(feature = "debug-validation", test))]
+            (grads, visible, diff_out.num_visible, loss_inner)
+        };
+
+        // The optimizer strips autodiff before stepping, so optimizer state
+        // (scaling, momentum) lives on the inner device.
+        let opt_device = device.clone().inner();
+        let optimizer =
+            self.optim.get_or_insert_with(|| {
+                let sh_degree = splats.sh_degree();
+                let num_coeffs = sh_coeffs_for_degree(sh_degree) as usize;
+
+                // DC (band 0) uses full LR; bands 1+ are scaled down.
+                let mut scales = vec![1.0f32; num_coeffs];
+                let rest_scale = 1.0 / self.config.lr_coeffs_sh_scale;
+                for s in &mut scales[1..] {
+                    *s = rest_scale;
+                }
+                let sh_lr_scales = Tensor::<1>::from_floats(scales.as_slice(), &opt_device)
+                    .reshape([1, num_coeffs as i32, 1]);
+
+                SplatOptim {
+                    adam: AdamScaled::new(1e-15),
+                    transforms: AdamState::new(None, false),
+                    sh_coeffs: AdamState::new(Some(sh_lr_scales), true),
+                    opacities: AdamState::new(None, false),
+                }
+            });
+
+        let lr_mean = self.config.lr_mean
+            * self.lr_mean_decay.powi(self.step_count as i32 - 1)
+            * median_scale as f64;
+
+        // Update per-component LR scaling for the transforms param.
+        // transforms layout: means(3) + rotations(4) + log_scales(3)
+        // We use base_lr=1.0 and encode actual LRs in the scaling tensor.
         {
-            brush_render::validation::validate_splat_gradients(&splats, &grads);
+            let lr_values: [f32; 10] = [
+                lr_mean as f32,
+                lr_mean as f32,
+                lr_mean as f32,
+                self.config.lr_rotation as f32,
+                self.config.lr_rotation as f32,
+                self.config.lr_rotation as f32,
+                self.config.lr_rotation as f32,
+                self.config.lr_scale as f32,
+                self.config.lr_scale as f32,
+                self.config.lr_scale as f32,
+            ];
+            optimizer.transforms.scaling =
+                Some(Tensor::<1>::from_floats(lr_values.as_slice(), &opt_device).reshape([1, 10]));
         }
 
-        let (lr_mean, lr_rotation, lr_scale, lr_coeffs, lr_opac) = (
-            self.sched_mean.step() * median_scale as f64,
-            self.config.lr_rotation,
-            // Scale is relative to the scene scale, but the exp() activation function
-            // means "offsetting" all values also solves the learning rate scaling.
-            self.sched_scale.step(),
-            self.config.lr_coeffs_dc,
-            self.config.lr_opac,
-        );
-
-        let optimizer = self.optim.get_or_insert_with(|| {
-            let sh_degree = splats.sh_degree();
-
-            let coeff_count = sh_coeffs_for_degree(sh_degree) as i32;
-            let sh_size = coeff_count;
-            let mut sh_lr_scales = vec![1.0];
-            for _ in 1..sh_size {
-                sh_lr_scales.push(1.0 / self.config.lr_coeffs_sh_scale);
-            }
-            let sh_lr_scales = Tensor::<_, 1>::from_floats(sh_lr_scales.as_slice(), &device)
-                .reshape([1, coeff_count, 1]);
-
-            create_default_optimizer().load_record(HashMap::from([(
-                splats.sh_coeffs.id,
-                AdaptorRecord::from_state(AdamState {
-                    momentum: None,
-                    scaling: Some(sh_lr_scales),
-                }),
-            )]))
-        });
-
         splats = trace_span!("Optimizer step").in_scope(|| {
-            splats = trace_span!("SH Coeffs step").in_scope(|| {
-                let grad_coeff =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.sh_coeffs.id]);
-                optimizer.step(lr_coeffs, splats, grad_coeff)
+            splats.transforms = trace_span!("Transforms step").in_scope(|| {
+                step_param(
+                    &optimizer.adam,
+                    1.0,
+                    splats.transforms,
+                    &mut optimizer.transforms,
+                    &mut grads,
+                )
             });
-            splats = trace_span!("Rotation step").in_scope(|| {
-                let grad_rot =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.rotations.id]);
-                optimizer.step(lr_rotation, splats, grad_rot)
+            splats.sh_coeffs = trace_span!("SH Coeffs step").in_scope(|| {
+                step_param(
+                    &optimizer.adam,
+                    self.config.lr_coeffs_dc,
+                    splats.sh_coeffs,
+                    &mut optimizer.sh_coeffs,
+                    &mut grads,
+                )
             });
-            splats = trace_span!("Scale step").in_scope(|| {
-                let grad_scale =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.log_scales.id]);
-                optimizer.step(lr_scale, splats, grad_scale)
-            });
-            splats = trace_span!("Mean step").in_scope(|| {
-                let grad_means =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.means.id]);
-                optimizer.step(lr_mean, splats, grad_means)
-            });
-            splats = trace_span!("Opacity step").in_scope(|| {
-                let grad_opac =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.raw_opacities.id]);
-                optimizer.step(lr_opac, splats, grad_opac)
+            splats.raw_opacities = trace_span!("Opacity step").in_scope(|| {
+                step_param(
+                    &optimizer.adam,
+                    self.config.lr_opac,
+                    splats.raw_opacities,
+                    &mut optimizer.opacities,
+                    &mut grads,
+                )
             });
             splats
         });
 
-        trace_span!("Housekeeping").in_scope(|| {
-            // Get the xy gradient norm from the dummy tensor.
-            let refine_weight = refine_weight_holder
-                .grad_remove(&mut grads)
-                .expect("XY gradients need to be calculated.");
-            let device = splats.device();
-            let num_splats = splats.num_splats();
-            let record = self
-                .refine_record
-                .get_or_insert_with(|| RefineRecord::new(num_splats, &device));
-
-            record.gather_stats(refine_weight, visible.clone().inner());
-        });
-
-        let device = splats.device();
         // Add random noise. Only do this in the growth phase, otherwise
         // let the splats settle in without noise, not much point in exploring regions anymore.
-        let inv_opac: Tensor<_, 1> = 1.0 - splats.opacities();
-        let noise_weight = inv_opac.inner().powi_scalar(150.0).clamp(0.0, 1.0) * visible.inner();
+        // The noise gate is non-differentiable bookkeeping. Read opacity from
+        // the valid (inner) splats so the sigmoid never lands on the autodiff
+        // graph, and `visible` is already inner — so nothing here builds a
+        // node that won't get a backward pass.
+        let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
+        let noise_weight = inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * visible;
         let noise_weight = noise_weight.unsqueeze_dim(1);
+        // `samples` is pure data — keep it on the inner device so it can
+        // multiply with the `.inner()`-stripped `noise_weight` without
+        // crossing backends.
         let samples = Tensor::random(
             [splats.num_splats() as usize, 3],
             Distribution::Normal(0.0, 1.0),
-            &device,
+            &splats.device().inner(),
         );
 
-        // Only allow noised gaussians to travel at most the entire extent of the current bounds.
-        let max_noise = median_scale;
-        // Could scale by train time, but, the mean_lr already heavily decays.
-        let noise_weight = noise_weight * (lr_mean as f32 * self.config.mean_noise_weight);
-        splats.means = splats.means.map(|m| {
-            Tensor::from_inner(m.inner() + (samples * noise_weight).clamp(-max_noise, max_noise))
-                .require_grad()
+        // Could scale by train time, but, the mean_lr already decays over time.
+        let noise_weight_means = noise_weight * (lr_mean as f32 * self.config.mean_noise_weight);
+
+        // Add noise to the means portion (cols 0..3), and optionally scales
+        // (cols 7..10) and rotations (cols 3..7).
+        splats.transforms = splats.transforms.map(|t| {
+            // Only allow noised gaussians to travel at most the entire extent of the current bounds.
+            let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
+            let inner = t.inner();
+            // slice + slice_assign with a clone of inner avoids holding two
+            // refs across slice_assign — `inner` is consumed by slice_assign
+            // and the resulting buffer is the only writer.
+            let noised_means = inner.clone().slice(s![.., 0..3]) + noise_m;
+            let out = inner.slice_assign(s![.., 0..3], noised_means);
+            Tensor::from_inner(out).require_grad()
         });
 
         let stats = TrainStepStats {
-            pred_image: pred_image.inner(),
             num_visible,
-            num_intersections,
-            loss: loss.inner(),
             lr_mean,
-            lr_rotation,
-            lr_scale,
-            lr_coeffs,
-            lr_opac,
+            lr_rotation: self.config.lr_rotation,
+            lr_scale: self.config.lr_scale,
+            lr_coeffs: self.config.lr_coeffs_dc,
+            lr_opac: self.config.lr_opac,
+            loss: loss_inner,
         };
 
         (splats, stats)
     }
 
-    pub async fn refine_if_needed(
-        &mut self,
-        iter: u32,
-        splats: Splats<DiffBackend>,
-    ) -> (Splats<DiffBackend>, Option<RefineStats>) {
-        let train_t = (iter as f32 / self.config.total_steps as f32).clamp(0.0, 1.0);
-
-        if iter == 0 || !iter.is_multiple_of(self.config.refine_every) || train_t > 0.95 {
-            return (splats, None);
-        }
-
-        let device = splats.means.device();
-        let client = WgpuRuntime::client(&device);
+    pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
+        let progress = iter as f32 / self.config.total_train_iters.max(1) as f32;
+        // Refine manipulates the canonical (un-floored) params, so bake the
+        // current 3D-filter floor into them first — split/clone/prune then see
+        // the splat's true scales with no double-apply. A freshly recomputed
+        // floor is attached at the end (below), once positions/count are known.
+        let splats = splats.bake_min_scale();
+        let device = splats.device();
+        let client = match device.as_dispatch() {
+            burn::backend::DispatchDevice::Cube(d) => Some(d.client()),
+            burn::backend::DispatchDevice::Autodiff(_) => None,
+        };
 
         let refiner = self
             .refine_record
             .take()
             .expect("Can only refine if refine stats are initialized");
 
+        // Track how many splats are visually large (the "big-low-α" failure
+        // mode). `max_screen_size` is the larger 2D ellipse extent as a
+        // fraction of the image dim; area is approximated by its square.
+        let ss_data = refiner
+            .max_screen_size
+            .clone()
+            .into_data_async()
+            .await
+            .expect("Failed to read screen size")
+            .try_into_vec::<f32>()
+            .expect("Failed to read screen size vec");
+        if !ss_data.is_empty() {
+            let mut sorted: Vec<f32> = ss_data.iter().copied().filter(|v| v.is_finite()).collect();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = sorted.len();
+            let pct = |p: f32| sorted[((p * (n - 1) as f32) as usize).min(n - 1)];
+            let n_total = n as f64;
+            let n_gt_025 = ss_data.iter().filter(|v| **v > 0.25).count();
+            let n_gt_010 = ss_data.iter().filter(|v| **v > 0.10).count();
+            let n_gt_005 = ss_data.iter().filter(|v| **v > 0.05).count();
+            let n_area_gt_005 = ss_data.iter().filter(|v| (*v * *v) > 0.05).count();
+            let n_area_gt_010 = ss_data.iter().filter(|v| (*v * *v) > 0.10).count();
+            log::info!(
+                "screen_size iter={} n={} max_dim p50={:.4} p95={:.4} p99={:.4} max={:.4} frac>0.05={:.4} frac>0.10={:.4} frac>0.25={:.4} frac_area>0.05={:.4} frac_area>0.10={:.4}",
+                iter,
+                n,
+                pct(0.5),
+                pct(0.95),
+                pct(0.99),
+                pct(1.0),
+                n_gt_005 as f64 / n_total,
+                n_gt_010 as f64 / n_total,
+                n_gt_025 as f64 / n_total,
+                n_area_gt_005 as f64 / n_total,
+                n_area_gt_010 as f64 / n_total,
+            );
+        }
+
         let max_allowed_bounds = self.bounds.extent.max_element() * 100.0;
 
         // If not refining, update splat to step with gradients applied.
         // Prune dead splats. This ALWAYS happen even if we're not "refining" anymore.
-        let mut record = self
+        let mut optim = self
             .optim
             .take()
-            .expect("Can only refine after optimizer is initialized")
-            .to_record();
-        let alpha_mask = splats.opacities().inner().lower_elem(MIN_OPACITY);
-        let scales = splats.scales().inner();
+            .expect("Can only refine after optimizer is initialized");
+        let alpha_mask = splats.opacities().lower_elem(MIN_OPACITY);
+        let scales = splats.scales();
 
-        let scale_small = scales.clone().lower_elem(1e-10).any_dim(1).squeeze_dim(1);
+        // Note: we do NOT cull on a minimum scale. A genuinely flat splat
+        // (a thin "pancake" representing a surface) legitimately has a tiny
+        // smallest axis, so there's no correct min-scale threshold — the
+        // non-finite check below still removes actually-degenerate splats.
         let scale_big = scales
+            .clone()
             .greater_elem(max_allowed_bounds)
             .any_dim(1)
             .squeeze_dim(1);
@@ -341,35 +499,86 @@ impl SplatTrainer {
         // Remove splats that are way out of bounds.
         let center = self.bounds.center;
         let bound_center =
-            Tensor::<_, 1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
-        let splat_dists = (splats.means.val().inner() - bound_center).abs();
+            Tensor::<1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
+        let splat_dists = (splats.means() - bound_center).abs();
         let bound_mask = splat_dists
             .greater_elem(max_allowed_bounds)
             .any_dim(1)
             .squeeze_dim(1);
+
+        // Prune parameter that's NaN.
+        fn row_non_finite(t: &Tensor<2>) -> Tensor<1, Bool> {
+            t.clone().is_finite().bool_not().any_dim(1).squeeze_dim(1)
+        }
+        let transforms_bad = row_non_finite(&splats.transforms.val());
+        let sh_bad = row_non_finite(&splats.sh_coeffs.val().flatten(1, 2));
+        let opac_bad = row_non_finite(&splats.raw_opacities.val().unsqueeze_dim(1));
+        let non_finite_mask = transforms_bad.bool_or(sh_bad).bool_or(opac_bad);
+        let num_pruned_non_finite = non_finite_mask
+            .clone()
+            .int()
+            .sum()
+            .into_scalar_async::<i32>()
+            .await
+            .expect("Failed to count non-finite splats") as u32;
+
         let prune_mask = alpha_mask
-            .bool_or(scale_small)
             .bool_or(scale_big)
-            .bool_or(bound_mask);
+            .bool_or(bound_mask)
+            .bool_or(non_finite_mask);
 
         let (mut splats, refiner, pruned_count) =
-            prune_points(splats, &mut record, refiner, prune_mask).await;
+            prune_points(splats, &mut optim, refiner, prune_mask).await;
         let mut split_inds = HashSet::new();
 
-        // Replace dead gaussians.
+        // Always replace dead gaussians, so that the pruned budget is reused.
         if pruned_count > 0 {
-            // Sample weighted by opacity from splat visible during optimization.
-            let resampled_weights = splats.opacities().inner() * refiner.vis_mask().float();
+            // Replacement weighting: opacity × visibility.
+            let vis_f = refiner.vis_mask().float();
+            let resampled_weights = splats.opacities() * vis_f.clone();
             let resampled_weights = resampled_weights
                 .into_data_async()
                 .await
                 .expect("Failed to get weights")
-                .into_vec::<f32>()
+                .try_into_vec::<f32>()
                 .expect("Failed to read weights");
             let resampled_inds = multinomial_sample(&resampled_weights, pruned_count);
             split_inds.extend(resampled_inds);
         }
 
+        // Force-split splats that are too big on screen (every refine). Rather
+        // than killing them (the old `kill_at_screen_size`), we split them and
+        // shrink the children down to `split_at_screen_size` on screen — see
+        // `refine_splats`. Capped by the remaining `max_splats` budget.
+        let pre_oversized = split_inds.len();
+        if self.config.split_at_screen_size > 0.0 {
+            let oversized = refiner.above_screen_size(self.config.split_at_screen_size);
+            let oversized_inds = oversized.argwhere_async().await;
+            if oversized_inds.dims()[0] > 0 {
+                let oversized_inds = oversized_inds
+                    .squeeze_dim::<1>(1)
+                    .into_data_async()
+                    .await
+                    .expect("Failed to get oversized indices")
+                    .try_into_vec::<i32>()
+                    .expect("Failed to read oversized indices");
+                let mut budget = self
+                    .config
+                    .max_splats
+                    .saturating_sub(splats.num_splats() + split_inds.len() as u32);
+                for ind in oversized_inds {
+                    if budget == 0 {
+                        break;
+                    }
+                    if split_inds.insert(ind) {
+                        budget -= 1;
+                    }
+                }
+            }
+        }
+        let num_split_oversized = (split_inds.len() - pre_oversized) as u32;
+
+        let pre_high_grad = split_inds.len();
         if iter < self.config.growth_stop_iter {
             let above_threshold = refiner.above_threshold(self.config.growth_grad_threshold);
 
@@ -377,7 +586,7 @@ impl SplatTrainer {
                 .clone()
                 .int()
                 .sum()
-                .into_scalar_async()
+                .into_scalar_async::<i32>()
                 .await
                 .expect("Failed to get threshold") as u32;
 
@@ -386,227 +595,245 @@ impl SplatTrainer {
 
             let sample_high_grad = grow_count.saturating_sub(pruned_count);
 
-            // Only grow to the max nr. of splats.
+            // Saturating — cur_splats can exceed max_splats if the scene
+            // was loaded above cap, and the u32 underflow would request
+            // ~4B new splats.
             let cur_splats = splats.num_splats() + split_inds.len() as u32;
-            let grow_count = sample_high_grad.min(self.config.max_splats - cur_splats);
+            let headroom = self.config.max_splats.saturating_sub(cur_splats);
+            let grow_count = sample_high_grad.min(headroom);
 
             // If still growing, sample from indices which are over the threshold.
             if grow_count > 0 {
-                let weights = above_threshold.float() * refiner.refine_weight_norm;
+                let weights = above_threshold.float() * refiner.refine_weight_norm.clone();
                 let weights = weights
                     .into_data_async()
                     .await
                     .expect("Failed to get weights")
-                    .into_vec::<f32>()
+                    .try_into_vec::<f32>()
                     .expect("Failed to read weights");
                 let growth_inds = multinomial_sample(&weights, grow_count);
                 split_inds.extend(growth_inds);
             }
         }
 
+        let num_split_high_grad = (split_inds.len() - pre_high_grad) as u32;
         let refine_count = split_inds.len();
-
-        splats = self.refine_splats(&device, record, splats, split_inds, train_t);
+        // Per-splat max on-screen extent, used by `refine_splats` to cap the
+        // split shrink so oversized splats' children land at `split_at_screen_size`.
+        let screen_sizes = refiner.max_screen_size.clone();
+        splats = self.refine_splats(&device, optim, splats, split_inds, screen_sizes, iter);
 
         // Update current bounds based on the splats.
-        self.bounds = splats.clone().get_bounds(BOUND_PERCENTILE).await;
+        self.bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
+        if let Some(client) = &client {
+            client.memory_cleanup();
+        }
 
-        client.memory_cleanup();
+        // Recompute the per-splat 3D-filter floor against the new positions/
+        // count and attach it — the floor is part of the splat from here until
+        // the next refine. Past the freeze fraction we stop refreshing and leave
+        // it baked in, so the tail settles against fixed params.
+        if progress < MIN_SCALE_FREEZE_FRAC {
+            // `splats` is already on the inner backend here, so `means()` is too.
+            // No-op when there are no view cameras (e.g. unit tests).
+            let means = splats.means();
+            if let Some(f) = compute_min_scale(&means, &self.view_cams, MIN_SCALE_FACTOR) {
+                splats = splats.with_min_scale(f);
+            }
+        }
+
+        let splat_count = splats.num_splats();
 
         (
             splats,
-            Some(RefineStats {
+            RefineStats {
                 num_added: refine_count as u32,
+                num_split_oversized,
+                num_split_high_grad,
                 num_pruned: pruned_count,
-            }),
+                num_pruned_non_finite,
+                total_splats: splat_count,
+            },
         )
     }
 
     fn refine_splats(
         &mut self,
-        device: &WgpuDevice,
-        mut record: HashMap<ParamId, AdaptorRecord<AdamScaled, DiffBackend>>,
-        mut splats: Splats<DiffBackend>,
+        device: &Device,
+        mut optim: SplatOptim,
+        mut splats: Splats,
         split_inds: HashSet<i32>,
-        train_t: f32,
-    ) -> Splats<DiffBackend> {
+        screen_sizes: Tensor<1>,
+        iter: u32,
+    ) -> Splats {
         let refine_count = split_inds.len();
 
         if refine_count > 0 {
             let refine_inds = Tensor::from_data(
-                TensorData::new(split_inds.into_iter().collect(), [refine_count]),
+                TensorData::new(split_inds.into_iter().collect::<Vec<_>>(), [refine_count]),
                 device,
             );
 
-            let cur_means = splats.means.val().inner().select(0, refine_inds.clone());
-            let cur_rots = splats
-                .rotations_normed()
-                .inner()
-                .select(0, refine_inds.clone());
-            let cur_log_scale = splats
-                .log_scales
-                .val()
-                .inner()
-                .select(0, refine_inds.clone());
-            let cur_coeff = splats
-                .sh_coeffs
-                .val()
-                .inner()
-                .select(0, refine_inds.clone());
-            let cur_raw_opac = splats
-                .raw_opacities
-                .val()
-                .inner()
-                .select(0, refine_inds.clone());
+            let cur_transforms = splats.transforms.val().select(0, refine_inds.clone());
+            let cur_means = cur_transforms.clone().slice(s![.., 0..3]);
+            let cur_rots_raw = cur_transforms.clone().slice(s![.., 3..7]);
+            let magnitudes = Tensor::clamp_min(
+                Tensor::sum_dim(cur_rots_raw.clone().powi_scalar(2), 1).sqrt(),
+                1e-32,
+            );
+            let cur_rots = cur_rots_raw / magnitudes;
+            let cur_log_scale = cur_transforms.slice(s![.., 7..10]);
+            let cur_sh_coeffs = splats.sh_coeffs.val().select(0, refine_inds.clone());
+            let cur_raw_opac = splats.raw_opacities.val().select(0, refine_inds.clone());
 
-            // The amount to offset the scale and opacity should maybe depend on how far away we have sampled these gaussians,
-            // but a fixed amount seems to work ok. The only note is that divide by _less_ than SQRT(2) seems to exponentially
-            // blow up, as more 'mass' is added each refine.
-            // let scale_div = Tensor::ones_like(&cur_log_scale) * SQRT_2.ln();
-            //
             let cur_scales = cur_log_scale.clone().exp();
 
             let cur_opac = sigmoid(cur_raw_opac.clone());
-            let inv_opac: Tensor<_, 1> = 1.0 - cur_opac;
-            let new_opac: Tensor<_, 1> = 1.0 - inv_opac.sqrt();
+            let inv_opac: Tensor<1> = 1.0 - cur_opac;
+            // Post-split child opacity as a power law in transmittance,
+            // p = 0.5 would keep the transmittance for cloning splats but as we offset them
+            // choose a higher p.
+            let new_opac: Tensor<1> = 1.0 - inv_opac.powf_scalar(FRAC_1_SQRT_2);
             let new_raw_opac = inv_sigmoid(new_opac.clamp(MIN_OPACITY, 1.0 - MIN_OPACITY));
-            let new_scales = scale_down_largest_dim(cur_scales.clone(), 0.5);
-            let new_log_scales = new_scales.log();
 
-            // Move in direction of scaling axis.
-            let samples = quaternion_vec_multiply(
-                cur_rots.clone(),
-                Tensor::random([refine_count, 1], Distribution::Normal(0.0, 1.0), device)
-                    * cur_scales,
-            );
+            // Smooth covariance-aware split. Per-axis shrink + mass-conserving
+            // deterministic offset (one child at +offset, the other at -offset).
+            // Children inherit the
+            // parent's rotation; the split is the scale shrink + ±offset.
+            let cur_scales_sq = cur_scales.clone().powi_scalar(2);
+            let max_scale_sq = cur_scales_sq.clone().max_dim(1).clamp_min(1e-30);
+            let ratio = cur_scales_sq / max_scale_sq;
+            // Max-axis shrink factor `k` (per splat). The standard split uses
+            // 1/√2 (mass-conserving). When `split_at_screen_size` is set, splats
+            // that are too big on screen shrink harder so their children land at
+            // (at most) the cap: `k = min(1/√2, split_at_screen_size / screen)`.
+            // Splats already within √2× of the cap are unaffected (min → 1/√2).
+            let k_per_axis: Tensor<2> = if self.config.split_at_screen_size > 0.0 {
+                let k_max = screen_sizes
+                    .select(0, refine_inds.clone())
+                    .unsqueeze_dim(1)
+                    .clamp_min(1e-6)
+                    .recip()
+                    .mul_scalar(self.config.split_at_screen_size)
+                    .clamp_max(FRAC_1_SQRT_2);
+                -(ratio * (-k_max + 1.0)) + 1.0
+            } else {
+                -(ratio * (1.0_f32 - FRAC_1_SQRT_2)) + 1.0
+            };
+            let offset_factor = (-k_per_axis.clone().powi_scalar(2) + 1.0)
+                .clamp_min(0.0)
+                .sqrt();
+            let offset_local = offset_factor * cur_scales;
+            let samples = quaternion_vec_multiply(cur_rots.clone(), offset_local);
+            let new_log_scales = cur_log_scale.clone() + k_per_axis.log();
+            let child_rots = cur_rots;
 
-            // Shrink & offset existing splats.
+            // Scatter into transforms: build a [refine_count, 10] update tensor
+            // with means offset in cols 0..3 and log_scales difference in cols 7..10
+            let refine_inds_10 = refine_inds.clone().unsqueeze_dim(1).repeat_dim(1, 10);
+            let scale_difference = new_log_scales.clone() - cur_log_scale;
 
-            // Scatter needs [N, 3] indices for means and scales.
-            let refine_inds_3 = refine_inds.clone().unsqueeze_dim(1).repeat_dim(1, 3);
-
-            splats.means = splats.means.map(|m| {
-                let new_means = m.inner().scatter(
-                    0,
-                    refine_inds_3.clone(),
-                    -samples.clone(),
-                    IndexingUpdateOp::Add,
-                );
-                Tensor::from_inner(new_means).require_grad()
-            });
-            splats.log_scales = splats.log_scales.map(|s| {
-                let difference = new_log_scales.clone() - cur_log_scale.clone();
-                let new_scales =
-                    s.inner()
-                        .scatter(0, refine_inds_3.clone(), difference, IndexingUpdateOp::Add);
-                Tensor::from_inner(new_scales).require_grad()
+            splats.transforms = splats.transforms.map(|t| {
+                let dev = t.device();
+                let mut update = Tensor::zeros([refine_count, 10], &dev);
+                // Place -samples in means columns (0..3)
+                update = update.slice_assign(s![.., 0..3], -samples.clone());
+                // Place scale difference in log_scales columns (7..10)
+                update = update.slice_assign(s![.., 7..10], scale_difference.clone());
+                t.scatter(0, refine_inds_10.clone(), update, IndexingUpdateOp::Add)
             });
             splats.raw_opacities = splats.raw_opacities.map(|m| {
                 let difference = new_raw_opac.clone() - cur_raw_opac.clone();
-                let new_opacities =
-                    m.inner()
-                        .scatter(0, refine_inds.clone(), difference, IndexingUpdateOp::Add);
-                Tensor::from_inner(new_opacities).require_grad()
+                m.scatter(0, refine_inds.clone(), difference, IndexingUpdateOp::Add)
             });
 
-            // Concatenate new splats.
-            let sh_dim = splats.sh_coeffs.dims()[1];
+            // Child sits at parent_mean + samples (parent moves to
+            // parent_mean - samples) — anti-correlated, centroid-preserving.
+            // Build new transforms row: means(3) + rotations(4) + log_scales(3)
+            let new_transforms =
+                Tensor::cat(vec![cur_means + samples, child_rots, new_log_scales], 1);
+
+            // Optimizer state lives on the inner (non-autodiff) device.
+            let opt_device = device.clone().inner();
+            let refine_inds_opt = refine_inds.to_device(&opt_device);
+
+            // Both halves of a split start with zero Adam moments.
+            //
+            // Burn's scatter bridge
+            // only implements Add, so we add the negated parent value to zero
+            // it out instead of using Assign.
             splats = map_splats_and_opt(
                 splats,
-                &mut record,
-                |x| Tensor::cat(vec![x, cur_means + samples], 0),
-                |x| Tensor::cat(vec![x, cur_rots], 0),
-                |x| Tensor::cat(vec![x, new_log_scales], 0),
-                |x| Tensor::cat(vec![x, cur_coeff], 0),
+                &mut optim,
+                |x| Tensor::cat(vec![x, new_transforms], 0),
+                |x| Tensor::cat(vec![x, cur_sh_coeffs], 0),
                 |x| Tensor::cat(vec![x, new_raw_opac], 0),
-                |x| Tensor::cat(vec![x, Tensor::zeros([refine_count, 3], device)], 0),
-                |x| Tensor::cat(vec![x, Tensor::zeros([refine_count, 4], device)], 0),
-                |x| Tensor::cat(vec![x, Tensor::zeros([refine_count, 3], device)], 0),
-                |x| Tensor::cat(vec![x, Tensor::zeros([refine_count, sh_dim, 3], device)], 0),
-                |x| Tensor::cat(vec![x, Tensor::zeros([refine_count], device)], 0),
+                |x: Tensor<2>| {
+                    let d1 = x.dims()[1];
+                    let neg_parent = -x.clone().select(0, refine_inds_opt.clone());
+                    let inds: Tensor<2, Int> =
+                        refine_inds_opt.clone().unsqueeze_dim(1).repeat_dim(1, d1);
+                    let x = x.scatter(0, inds, neg_parent, IndexingUpdateOp::Add);
+                    Tensor::cat(vec![x, Tensor::zeros([refine_count, d1], &opt_device)], 0)
+                },
+                |x: Tensor<3>| {
+                    let [_, d1, d2] = x.dims();
+                    let neg_parent = -x.clone().select(0, refine_inds_opt.clone());
+                    let inds_2: Tensor<2, Int> =
+                        refine_inds_opt.clone().unsqueeze_dim(1).repeat_dim(1, d1);
+                    let inds: Tensor<3, Int> = inds_2.unsqueeze_dim(2).repeat_dim(2, d2);
+                    let x = x.scatter(0, inds, neg_parent, IndexingUpdateOp::Add);
+                    Tensor::cat(
+                        vec![x, Tensor::zeros([refine_count, d1, d2], &opt_device)],
+                        0,
+                    )
+                },
+                |x: Tensor<1>| {
+                    let neg_parent = -x.clone().select(0, refine_inds_opt.clone());
+                    let x = x.scatter(
+                        0,
+                        refine_inds_opt.clone(),
+                        neg_parent,
+                        IndexingUpdateOp::Add,
+                    );
+                    Tensor::cat(vec![x, Tensor::zeros([refine_count], &opt_device)], 0)
+                },
             );
         }
 
+        let train_t = (iter as f32 / self.config.total_train_iters as f32).clamp(0.0, 1.0);
         let t_shrink_strength = 1.0 - train_t;
         let minus_opac = self.config.opac_decay * t_shrink_strength;
-        let scale_scaling = 1.0 - self.config.scale_decay * t_shrink_strength;
 
         // Lower opacity slowly over time.
         splats.raw_opacities = splats.raw_opacities.map(|f| {
-            let new_opac = sigmoid(f.inner()) - minus_opac;
-            Tensor::from_inner(inv_sigmoid(new_opac.clamp(1e-12, 1.0 - 1e-12))).require_grad()
+            let new_opac = sigmoid(f) - minus_opac;
+            inv_sigmoid(new_opac.clamp(1e-12, 1.0 - 1e-12))
         });
 
-        splats.log_scales = splats.log_scales.map(|f| {
-            let new_scale = f.inner().exp() * scale_scaling;
-            Tensor::from_inner(new_scale.log()).require_grad()
-        });
-
-        self.optim = Some(create_default_optimizer().load_record(record));
+        self.optim = Some(optim);
         splats
     }
 }
 
 fn map_splats_and_opt(
-    mut splats: Splats<DiffBackend>,
-    record: &mut HashMap<ParamId, AdaptorRecord<AdamScaled, DiffBackend>>,
-    map_mean: impl FnOnce(Tensor<MainBackend, 2>) -> Tensor<MainBackend, 2>,
-    map_rotation: impl FnOnce(Tensor<MainBackend, 2>) -> Tensor<MainBackend, 2>,
-    map_scale: impl FnOnce(Tensor<MainBackend, 2>) -> Tensor<MainBackend, 2>,
-    map_coeffs: impl FnOnce(Tensor<MainBackend, 3>) -> Tensor<MainBackend, 3>,
-    map_opac: impl FnOnce(Tensor<MainBackend, 1>) -> Tensor<MainBackend, 1>,
+    mut splats: Splats,
+    optim: &mut SplatOptim,
+    map_transforms: impl FnOnce(Tensor<2>) -> Tensor<2>,
+    map_sh_coeffs: impl FnOnce(Tensor<3>) -> Tensor<3>,
+    map_opac: impl FnOnce(Tensor<1>) -> Tensor<1>,
 
-    map_opt_mean: impl Fn(Tensor<MainBackend, 2>) -> Tensor<MainBackend, 2>,
-    map_opt_rotation: impl Fn(Tensor<MainBackend, 2>) -> Tensor<MainBackend, 2>,
-    map_opt_scale: impl Fn(Tensor<MainBackend, 2>) -> Tensor<MainBackend, 2>,
-    map_opt_coeffs: impl Fn(Tensor<MainBackend, 3>) -> Tensor<MainBackend, 3>,
-    map_opt_opac: impl Fn(Tensor<MainBackend, 1>) -> Tensor<MainBackend, 1>,
-) -> Splats<DiffBackend> {
-    splats.means = splats
-        .means
-        .map(|x| Tensor::from_inner(map_mean(x.inner())).require_grad());
-    map_opt(splats.means.id, record, &map_opt_mean);
-
-    splats.rotations = splats
-        .rotations
-        .map(|x| Tensor::from_inner(map_rotation(x.inner())).require_grad());
-    map_opt(splats.rotations.id, record, &map_opt_rotation);
-
-    splats.log_scales = splats
-        .log_scales
-        .map(|x| Tensor::from_inner(map_scale(x.inner())).require_grad());
-    map_opt(splats.log_scales.id, record, &map_opt_scale);
-
-    splats.sh_coeffs = splats
-        .sh_coeffs
-        .map(|x| Tensor::from_inner(map_coeffs(x.inner())).require_grad());
-    map_opt(splats.sh_coeffs.id, record, &map_opt_coeffs);
-
-    splats.raw_opacities = splats
-        .raw_opacities
-        .map(|x| Tensor::from_inner(map_opac(x.inner())).require_grad());
-    map_opt(splats.raw_opacities.id, record, &map_opt_opac);
-
+    map_opt_transforms: impl Fn(Tensor<2>) -> Tensor<2>,
+    map_opt_sh_coeffs: impl Fn(Tensor<3>) -> Tensor<3>,
+    map_opt_opac: impl Fn(Tensor<1>) -> Tensor<1>,
+) -> Splats {
+    splats.transforms = splats.transforms.map(map_transforms);
+    optim.transforms.map_momentum(map_opt_transforms);
+    splats.sh_coeffs = splats.sh_coeffs.map(map_sh_coeffs);
+    optim.sh_coeffs.map_momentum(map_opt_sh_coeffs);
+    splats.raw_opacities = splats.raw_opacities.map(map_opac);
+    optim.opacities.map_momentum(map_opt_opac);
     splats
-}
-
-fn map_opt<B: AutodiffBackend, const D: usize>(
-    param_id: ParamId,
-    record: &mut HashMap<ParamId, AdaptorRecord<AdamScaled, B>>,
-    map_opt: &impl Fn(Tensor<B::InnerBackend, D>) -> Tensor<B::InnerBackend, D>,
-) {
-    let mut state: AdamState<_, D> = record
-        .remove(&param_id)
-        .expect("failed to get optimizer record")
-        .into_state();
-
-    state.momentum = state.momentum.map(|mut moment| {
-        moment.moment_1 = map_opt(moment.moment_1);
-        moment.moment_2 = map_opt(moment.moment_2);
-        moment
-    });
-
-    record.insert(param_id, AdaptorRecord::from_state(state));
 }
 
 // Prunes points based on the given mask.
@@ -614,11 +841,11 @@ fn map_opt<B: AutodiffBackend, const D: usize>(
 // Args:
 //   mask: bool[n]. If True, prune this Gaussian.
 async fn prune_points(
-    mut splats: Splats<DiffBackend>,
-    record: &mut HashMap<ParamId, AdaptorRecord<AdamScaled, DiffBackend>>,
-    mut refiner: RefineRecord<MainBackend>,
-    prune: Tensor<MainBackend, 1, Bool>,
-) -> (Splats<DiffBackend>, RefineRecord<MainBackend>, u32) {
+    mut splats: Splats,
+    optim: &mut SplatOptim,
+    mut refiner: RefineRecord,
+    prune: Tensor<1, Bool>,
+) -> (Splats, RefineRecord, u32) {
     assert_eq!(
         prune.dims()[0] as u32,
         splats.num_splats(),
@@ -641,13 +868,10 @@ async fn prune_points(
     let new_points = valid_inds.dims()[0] as u32;
     if new_points < start_splats {
         let valid_inds = valid_inds.squeeze_dim(1);
+        let inner_valid_inds = valid_inds.clone().without_autodiff();
         splats = map_splats_and_opt(
             splats,
-            record,
-            |x| x.select(0, valid_inds.clone()),
-            |x| x.select(0, valid_inds.clone()),
-            |x| x.select(0, valid_inds.clone()),
-            |x| x.select(0, valid_inds.clone()),
+            optim,
             |x| x.select(0, valid_inds.clone()),
             |x| x.select(0, valid_inds.clone()),
             |x| x.select(0, valid_inds.clone()),
@@ -655,14 +879,22 @@ async fn prune_points(
             |x| x.select(0, valid_inds.clone()),
             |x| x.select(0, valid_inds.clone()),
         );
-        refiner = refiner.keep(valid_inds);
+        refiner = refiner.keep(inner_valid_inds);
     }
     (splats, refiner, start_splats - new_points)
 }
 
-fn scale_down_largest_dim<B: Backend>(scales: Tensor<B, 2>, factor: f32) -> Tensor<B, 2> {
-    // Find the maximum values along dimension 1 (keeping dimensions for broadcasting)
-    let max_mask = scales.clone().equal(scales.clone().max_dim(1));
-    let scale = Tensor::ones_like(&scales).mask_fill(max_mask, factor);
-    scales.mul(scale)
+/// Sample a background color: base + uniform noise in [-strength, +strength], clamped to [0, 1].
+fn sample_background_color(base: glam::Vec3, strength: f32) -> glam::Vec3 {
+    if strength <= 0.0 {
+        return base.clamp(glam::Vec3::ZERO, glam::Vec3::ONE);
+    }
+    use rand::RngExt as _;
+    let mut rng = rand::rng();
+    let noise = glam::Vec3::new(
+        rng.random_range(-strength..strength),
+        rng.random_range(-strength..strength),
+        rng.random_range(-strength..strength),
+    );
+    (base + noise).clamp(glam::Vec3::ZERO, glam::Vec3::ONE)
 }

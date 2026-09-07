@@ -14,13 +14,13 @@ jobs:
     name: Format + check
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           lfs: true
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.89.0
+          toolchain: 1.95.0
           components: rustfmt, clippy
 
       - name: Install packages (Linux)
@@ -38,95 +38,92 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
 
-      - name: check --all-features
-        run: cargo check --locked --all-features --all-targets
-
-      - name: check --no-default-features
-        run: cargo check --locked --no-default-features --all-targets
-
       - name: Rustfmt
         run: cargo fmt --all -- --check
 
-      - name: cargo doc
-        run: cargo doc --no-deps --all-features
-
-      - name: cargo doc --document-private-items
-        run: cargo doc --document-private-items --no-deps --all-features
-
+      # clippy subsumes `cargo check` (same lints plus more), so no separate
+      # check step for the all-features config.
       - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: check --no-default-features
+        run: cargo check --locked --workspace --no-default-features --all-targets
+
+      # `--document-private-items` is a superset of the public-docs run.
+      - name: cargo doc
+        run: cargo doc --workspace --document-private-items --no-deps --all-features
 
   # ---------------------------------------------------------------------------
 
-  check_wasm:
-    name: Check wasm32 + wasm-bindgen
+  wasm-check:
+    name: Check wasm32
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.89.0
-          targets: wasm32-unknown-unknown
-
-      - run: sudo apt-get update && sudo apt-get install libgtk-3-dev libatk1.0-dev
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v2"
-          shared-key: "brush"
-          cache-workspace-crates: true
-
-      - name: Check wasm32
-        run: RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check -p brush-wasm --target wasm32-unknown-unknown
-
-  # ---------------------------------------------------------------------------
-
-  cargo-deny:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-          - target: aarch64-linux-android
-          - target: wasm32-unknown-unknown
-          - target: x86_64-pc-windows-msvc
-          - target: x86_64-unknown-linux-musl
-
-    name: cargo-deny ${{ matrix.target }}
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          rust-version: "1.89.0"
-          log-level: error
-          command: check
-          arguments: --target  ${{ matrix.target }}
-
-  # ---------------------------------------------------------------------------
-
-  tests:
-    name: Run tests
-    # We run the tests on macOS because it will run with an actual GPU
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           lfs: true
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.89.0
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2"
+          shared-key: "brush-wasm"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+
+      # The browser build (brush-app / brush-js cdylibs) is only compiled for
+      # wasm32; the host-only jobs above never exercise it. Check it here so a
+      # wasm-only break can't ship green.
+      - name: check wasm32 (browser crates)
+        run: cargo check --locked -p brush-app -p brush-js --lib --target wasm32-unknown-unknown
+
+  # ---------------------------------------------------------------------------
+
+  # One job for all targets: deny.toml's [graph] targets list drives the
+  # resolution, so no per-target matrix is needed.
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.95.0"
+          log-level: error
+          command: check
+
+  # ---------------------------------------------------------------------------
+
+  tests:
+    name: Run tests
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
 
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2"
           shared-key: "brush"
           cache-workspace-crates: true
+          cache-on-failure: true
 
+      # Doc-tests are included in the default `cargo test` target set, so no
+      # separate --doc step is needed.
       - name: Run tests
-        run: cargo test --all --all-features
-
-      - name: Run doc-tests
-        run: cargo test --all --all-features --doc
+        # Not --all-features: `brush-cube/metal` is opt-in and would be swept
+        # in. CI runners only have a paravirtual GPU, which cannot compile
+        # MSL, and enabling the feature switches burn to u8 bool storage that
+        # the WGSL fallback then chokes on. debug-validation cascades from
+        # brush-app to render/train/process.
+        run: cargo test --all --features brush-app/debug-validation

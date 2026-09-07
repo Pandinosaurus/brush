@@ -6,26 +6,29 @@ pub mod ply_gaussian;
 pub mod quant;
 
 // Re-export main functionality
-pub use export::splat_to_ply;
-pub use import::{ParseMetadata, SplatMessage, load_splat_from_ply, stream_splat_from_ply};
+pub use export::{ExportError, splat_to_ply};
+pub use import::{
+    ParseMetadata, SplatData, SplatMessage, load_splat_from_ply, stream_splat_from_ply,
+};
 pub use ply_gaussian::PlyGaussian;
 
 // Re-export serde-ply types for compatibility
-pub use serde_ply::{DeserializeError, SerializeError};
+pub use serde_ply::DeserializeError;
 
 #[cfg(test)]
+#[allow(unused)]
 mod test_utils {
-    use brush_render::MainBackend;
-    use brush_render::gaussian_splats::Splats;
+    use brush_render::gaussian_splats::{SplatRenderMode, Splats};
     use brush_render::sh::sh_coeffs_for_degree;
     use burn::backend::wgpu::WgpuDevice;
+    use burn::tensor::Device;
 
-    pub fn create_test_splats(sh_degree: u32) -> Splats<MainBackend> {
+    pub fn create_test_splats(sh_degree: u32) -> Splats {
         create_test_splats_with_count(sh_degree, 1)
     }
 
-    pub fn create_test_splats_with_count(sh_degree: u32, num_splats: usize) -> Splats<MainBackend> {
-        let device = WgpuDevice::default();
+    pub fn create_test_splats_with_count(sh_degree: u32, num_splats: usize) -> Splats {
+        let device: Device = WgpuDevice::default().into();
         let coeffs_per_channel = sh_coeffs_for_degree(sh_degree) as usize;
 
         let mut means = Vec::new();
@@ -55,12 +58,13 @@ mod test_utils {
             opacities.push(0.8 - offset * 0.1);
         }
 
-        Splats::<MainBackend>::from_raw(
+        Splats::from_raw(
             means,
-            Some(rotations),
-            Some(log_scales),
-            Some(sh_coeffs),
-            Some(opacities),
+            rotations,
+            log_scales,
+            sh_coeffs,
+            opacities,
+            SplatRenderMode::Default,
             &device,
         )
         .with_sh_degree(sh_degree)

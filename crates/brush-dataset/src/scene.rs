@@ -1,131 +1,16 @@
-use brush_render::{bounding_box::BoundingBox, camera::Camera};
-use brush_vfs::BrushVfs;
+use brush_render::{AlphaMode, bounding_box::BoundingBox, camera::Camera};
 use burn::tensor::TensorData;
 use glam::{Affine3A, Vec3, vec3};
-use image::{DynamicImage, GenericImageView};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-use tokio::io::AsyncReadExt;
+use image::DynamicImage;
+use std::sync::Arc;
 
-use crate::config::AlphaMode;
+pub use crate::load_image::LoadImage;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ViewType {
     Train,
     Eval,
     Test,
-}
-
-#[derive(Clone, Debug)]
-pub struct LoadImage {
-    vfs: Arc<BrushVfs>,
-    path: PathBuf,
-    mask_path: Option<PathBuf>,
-    max_resolution: u32,
-    alpha_mode: AlphaMode,
-}
-
-impl PartialEq for LoadImage {
-    fn eq(&self, other: &Self) -> bool {
-        self.path == other.path
-            && self.mask_path == other.mask_path
-            && self.max_resolution == other.max_resolution
-    }
-}
-
-impl LoadImage {
-    pub fn new(
-        vfs: Arc<BrushVfs>,
-        path: PathBuf,
-        mask_path: Option<PathBuf>,
-        max_resolution: u32,
-        override_alpha_mode: Option<AlphaMode>,
-    ) -> Self {
-        let alpha_mode = override_alpha_mode.unwrap_or_else(|| {
-            if mask_path.is_some() {
-                AlphaMode::Masked
-            } else {
-                AlphaMode::Transparent
-            }
-        });
-
-        Self {
-            vfs,
-            path,
-            mask_path,
-            max_resolution,
-            alpha_mode,
-        }
-    }
-
-    pub async fn load(&self) -> image::ImageResult<DynamicImage> {
-        let mut img_bytes = vec![];
-        self.vfs
-            .reader_at_path(&self.path)
-            .await?
-            .read_to_end(&mut img_bytes)
-            .await?;
-        let mut img = image::load_from_memory(&img_bytes)?;
-
-        // Copy over mask.
-        // TODO: Interleave this work better & speed things up here.
-        if let Some(mask_path) = &self.mask_path {
-            // Add in alpha channel if needed to the image to copy the mask into.
-            let mut masked_img = img.into_rgba8();
-            let mut mask_bytes = vec![];
-            self.vfs
-                .reader_at_path(mask_path)
-                .await?
-                .read_to_end(&mut mask_bytes)
-                .await?;
-            let mut mask_img = image::load_from_memory(&mask_bytes)?;
-
-            // Resize mask image if needed. This is allowed to squash the mask.
-            if mask_img.dimensions() != masked_img.dimensions() {
-                mask_img = mask_img.resize_exact(
-                    masked_img.width(),
-                    masked_img.height(),
-                    image::imageops::FilterType::Triangle,
-                );
-            }
-
-            if mask_img.color().has_alpha() {
-                let mask_img = mask_img.into_rgba8();
-                for (pixel, mask_pixel) in masked_img.pixels_mut().zip(mask_img.pixels()) {
-                    pixel[3] = mask_pixel[3];
-                }
-            } else {
-                let mask_img = mask_img.into_rgb8();
-                for (pixel, mask_pixel) in masked_img.pixels_mut().zip(mask_img.pixels()) {
-                    pixel[3] = mask_pixel[0];
-                }
-            }
-
-            img = masked_img.into();
-        }
-        if img.width() <= self.max_resolution && img.height() <= self.max_resolution {
-            return Ok(img);
-        }
-        Ok(img.resize(
-            self.max_resolution,
-            self.max_resolution,
-            image::imageops::FilterType::Triangle,
-        ))
-    }
-
-    pub fn alpha_mode(&self) -> AlphaMode {
-        self.alpha_mode
-    }
-
-    pub fn img_name(&self) -> String {
-        Path::new(&self.path)
-            .file_stem()
-            .expect("No file name for eval view.")
-            .to_string_lossy()
-            .to_string()
-    }
 }
 
 #[derive(Clone)]
@@ -173,6 +58,17 @@ impl Scene {
         BoundingBox::from_min_max(min, max)
     }
 
+    pub fn with_image_scale(self, scale: f32) -> Self {
+        let views = Arc::unwrap_or_clone(self.views)
+            .into_iter()
+            .map(|v| SceneView {
+                image: v.image.with_scale(scale),
+                camera: v.camera,
+            })
+            .collect();
+        Self::new(views)
+    }
+
     pub fn get_nearest_view(&self, reference: Affine3A) -> Option<usize> {
         self.views
             .iter()
@@ -188,57 +84,118 @@ impl Scene {
     }
 }
 
-// Converts an image to a train sample. The tensor will be a floating point image with a [0, 1] image.
-//
-// This assume the input image has un-premultiplied alpha, whereas the output has pre-multiplied alpha.
-pub fn view_to_sample_image(image: DynamicImage, alpha_mode: AlphaMode) -> DynamicImage {
-    if image.color().has_alpha() && alpha_mode == AlphaMode::Transparent {
-        let mut rgba_bytes = image.to_rgba8();
+/// Convert a loaded view into the GPU-side packed representation: `[H, W]`
+/// u32, each entry packing `[r8 g8 b8 a8]`. Images without alpha get
+/// `a = 255` (fully opaque) so the kernel always sees a valid alpha byte.
+/// Returns `(packed, has_alpha)` so the trainer knows whether to apply
+/// alpha-dependent loss terms.
+///
+/// Transparent-alpha views arrive un-premultiplied and leave premultiplied.
+/// That happens here rather than in a pass of its own: premultiplying,
+/// widening to RGBA and packing all read the same pixel, so they cost one
+/// walk over the image and one allocation between them.
+pub fn view_to_packed_data(image: DynamicImage, alpha_mode: AlphaMode) -> (TensorData, bool) {
+    let _span = tracing::trace_span!("view_to_packed").entered();
+    let (w, h) = (image.width(), image.height());
+    let has_alpha = image.color().has_alpha();
+    // Premultiplication is what `Transparent` means; a mask multiplies the
+    // loss instead and must keep its colours intact.
+    let premultiply = has_alpha && alpha_mode == AlphaMode::Transparent;
 
-        // Assume image has un-multiplied alpha and convert it to pre-multiplied.
-        // Perform multiplication in byte space before converting to float.
-        for pixel in rgba_bytes.chunks_exact_mut(4) {
-            let r = pixel[0];
-            let g = pixel[1];
-            let b = pixel[2];
-            let a = pixel[3];
+    // Pack as `[i32]` little-endian (same bit pattern as u32; i32 because the
+    // burn dispatch backend's default int dtype is i32 and refuses to cast
+    // u32 values >= 2^31). The kernel reads the same way (`val & 0xff` is
+    // `r`, `>> 24` is `a`) — the signedness only affects the host-side
+    // TensorData metadata, not the GPU bytes.
+    let packed: Vec<i32> = match image {
+        DynamicImage::ImageRgb8(img) => img
+            .pixels()
+            .map(|p| i32::from_le_bytes([p[0], p[1], p[2], 255]))
+            .collect(),
+        DynamicImage::ImageRgba8(img) => pack_rgba(&img, premultiply),
+        // 16-bit, luma and cmyk sources are rare; normalise them first.
+        other => pack_rgba(&other.into_rgba8(), premultiply),
+    };
 
-            pixel[0] = ((r as u16 * a as u16 + 127) / 255) as u8;
-            pixel[1] = ((g as u16 * a as u16 + 127) / 255) as u8;
-            pixel[2] = ((b as u16 * a as u16 + 127) / 255) as u8;
-            pixel[3] = a;
-        }
-        DynamicImage::ImageRgba8(rgba_bytes)
-    } else {
-        image
-    }
+    (TensorData::new(packed, [h as usize, w as usize]), has_alpha)
 }
 
-pub fn sample_to_tensor_data(sample: DynamicImage) -> TensorData {
-    let _span = tracing::trace_span!("sample_to_tensor").entered();
-
-    let (w, h) = (sample.width(), sample.height());
-    tracing::trace_span!("Img to vec").in_scope(|| {
-        if sample.color().has_alpha() {
-            TensorData::new(
-                sample.into_rgba32f().into_vec(),
-                [h as usize, w as usize, 4],
-            )
-        } else {
-            TensorData::new(sample.into_rgb32f().into_vec(), [h as usize, w as usize, 3])
-        }
-    })
+fn pack_rgba(img: &image::RgbaImage, premultiply: bool) -> Vec<i32> {
+    img.pixels()
+        .map(|p| {
+            let [r, g, b, a] = p.0;
+            if premultiply {
+                // Multiply in byte space, before anything converts to float.
+                let mul = |c: u8| ((c as u16 * a as u16 + 127) / 255) as u8;
+                i32::from_le_bytes([mul(r), mul(g), mul(b), a])
+            } else {
+                i32::from_le_bytes([r, g, b, a])
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
 pub struct SceneBatch {
-    pub img_tensor: TensorData,
+    /// `[H, W]` u32, each entry packs `[r g b a]` u8.
+    pub img_packed: TensorData,
+    /// True when the source image had an alpha channel that the trainer
+    /// should consume (mask weight, alpha-matching loss, bg compositing).
+    pub has_alpha: bool,
     pub alpha_mode: AlphaMode,
     pub camera: Camera,
 }
 
 impl SceneBatch {
-    pub fn has_alpha(&self) -> bool {
-        self.img_tensor.shape[2] == 4
+    /// Host bytes the packed image occupies.
+    pub fn packed_bytes(&self) -> u64 {
+        self.img_packed
+            .as_bytes()
+            .len()
+            .try_into()
+            .expect("shouldn't exceed ~18 Exabytes...")
+    }
+
+    pub fn img_size(&self) -> [usize; 2] {
+        [self.img_packed.shape[0], self.img_packed.shape[1]]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::view_to_packed_data;
+    use brush_render::AlphaMode;
+    use image::{DynamicImage, ImageBuffer, RgbImage, RgbaImage};
+
+    #[test]
+    fn packs_rgba_samples_without_changing_channels() {
+        let image =
+            RgbaImage::from_raw(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]).expect("valid RGBA image");
+
+        let (packed, has_alpha) =
+            view_to_packed_data(DynamicImage::ImageRgba8(image), AlphaMode::Masked);
+
+        assert!(has_alpha);
+        assert_eq!(packed.shape.dims(), [1, 2]);
+        assert_eq!(
+            packed.as_slice::<i32>().expect("i32 tensor"),
+            &[0x0403_0201, 0x0807_0605]
+        );
+    }
+
+    #[test]
+    fn fills_missing_alpha_with_opaque_for_rgb_samples() {
+        let image: RgbImage =
+            ImageBuffer::from_raw(2, 1, vec![9, 10, 11, 12, 13, 14]).expect("valid RGB image");
+
+        let (packed, has_alpha) =
+            view_to_packed_data(DynamicImage::ImageRgb8(image), AlphaMode::Transparent);
+
+        assert!(!has_alpha);
+        assert_eq!(packed.shape.dims(), [1, 2]);
+        assert_eq!(
+            packed.as_slice::<i32>().expect("i32 tensor"),
+            &[0xff0b_0a09_u32 as i32, 0xff0e_0d0c_u32 as i32]
+        );
     }
 }

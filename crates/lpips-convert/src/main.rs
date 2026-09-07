@@ -1,30 +1,40 @@
 #![recursion_limit = "256"]
 
-use burn::module::Module;
-use burn::record::FullPrecisionSettings;
-use burn::record::HalfPrecisionSettings;
-use burn::record::Recorder;
-use burn::tensor::backend::Backend;
-use lpips::LpipsModel;
+#[cfg(not(target_family = "wasm"))]
+mod convert {
+    use burn::module::{Module, ModuleMapper, Param};
+    use burn::tensor::{DType, Device, Tensor};
+    use burn_store::ModuleSnapshot;
+    use lpips::LpipsModel;
 
-fn convert_lpips<B: Backend>(device: &B::Device) {
-    let model = LpipsModel::<B>::new(device);
-    let record: <LpipsModel<B> as Module<B>>::Record =
-        burn_import::pytorch::PyTorchFileRecorder::<FullPrecisionSettings>::default()
-            .load(
-                burn_import::pytorch::LoadArgs::new("./lpips_vgg_remapped.pth".into()),
-                device,
-            )
-            .expect("Should decode state successfully");
-    let model = model.load_record(record);
-    let recorder = burn::record::BinFileRecorder::<HalfPrecisionSettings>::new();
-    model
-        .save_file("./burn_mapped", &recorder)
-        .expect("Failed to convert model");
+    /// Casts every float parameter to f16 so the packed weights stay half precision.
+    struct CastF16;
+
+    impl ModuleMapper for CastF16 {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
+            let (id, tensor, mapper) = param.consume();
+            Param::from_mapped_value(id, tensor.cast(DType::F16), mapper)
+        }
+    }
+
+    pub fn convert_lpips(device: &Device) {
+        let mut store = burn_store::pytorch::PytorchStore::from_file("./lpips_vgg_remapped.pth");
+        let mut model = LpipsModel::new(device);
+        model.load_from(&mut store).expect("Failed to load model");
+
+        model
+            .map(&mut CastF16)
+            .into_record()
+            .save("./burn_mapped.bpk")
+            .expect("Failed to convert model");
+    }
 }
 
 fn main() {
-    println!("Converting LPIPS PyTorch model to Burn format...");
-    convert_lpips::<burn::backend::Wgpu>(&burn::backend::wgpu::WgpuDevice::default());
-    println!("Conversion completed successfully!");
+    #[cfg(not(target_family = "wasm"))]
+    {
+        println!("Converting LPIPS PyTorch model to Burn format...");
+        convert::convert_lpips(&burn::backend::wgpu::WgpuDevice::default().into());
+        println!("Conversion completed successfully!");
+    }
 }

@@ -1,12 +1,13 @@
 #![recursion_limit = "256"]
 
 pub mod config;
+pub mod load_image;
 pub mod scene;
 pub mod scene_loader;
 
 mod formats;
 
-pub use formats::load_dataset;
+pub use formats::{DatasetLoadResult, load_dataset};
 
 use core::f32;
 use glam::{Mat3, Mat4, Vec3};

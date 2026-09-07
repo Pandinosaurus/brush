@@ -1,9 +1,11 @@
 use crate::{BrushVfs, VfsConstructError};
+use core::fmt;
 use rrfd::PickFileError;
 use serde::Deserialize;
 #[cfg(not(target_family = "wasm"))]
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::io::BufReader;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -12,6 +14,12 @@ pub enum DataSource {
     PickDirectory,
     Url(String),
     Path(String),
+    /// A directory handle the host has already obtained (e.g. via JS
+    /// `showDirectoryPicker`). Constructed programmatically — never
+    /// (de)serialised from CLI args or saved state.
+    #[cfg(target_family = "wasm")]
+    #[serde(skip)]
+    PickedDirectory(rrfd::wasm::DirectoryHandle, String),
 }
 
 // Implement FromStr to allow Clap to parse string arguments into DataSource
@@ -25,6 +33,19 @@ impl FromStr for DataSource {
             }
             // This path might not exist but that's ok, rather find that out later.
             s => Ok(Self::Path(s.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for DataSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PickFile => write!(f, "File"),
+            Self::PickDirectory => write!(f, "Directory"),
+            Self::Url(_) => write!(f, "URL"),
+            Self::Path(_) => write!(f, "Path"),
+            #[cfg(target_family = "wasm")]
+            Self::PickedDirectory(_, name) => write!(f, "{name}"),
         }
     }
 }
@@ -46,36 +67,43 @@ pub enum DataSourceError {
 }
 
 impl DataSource {
-    pub async fn into_vfs(self) -> Result<BrushVfs, DataSourceError> {
+    pub async fn into_vfs(self) -> Result<Arc<BrushVfs>, DataSourceError> {
         match self {
             Self::PickFile => {
-                let reader = BufReader::new(rrfd::pick_file().await?);
-                log::info!("Got file reader");
-                Ok(BrushVfs::from_reader(reader).await?)
+                let picked = rrfd::pick_file().await?;
+                log::info!("Got file: {}", picked.name);
+                let reader = BufReader::new(picked.reader);
+                Ok(Arc::new(
+                    BrushVfs::from_reader(reader, Some(picked.name)).await?,
+                ))
             }
             Self::PickDirectory => {
                 #[cfg(not(target_family = "wasm"))]
                 {
                     let picked = rrfd::pick_directory().await?;
-                    Ok(BrushVfs::from_path(&picked).await?)
+                    Ok(Arc::new(BrushVfs::from_path(&picked).await?))
                 }
                 #[cfg(target_family = "wasm")]
                 {
                     let dir_handle = rrfd::wasm::pick_directory_handle().await?;
-                    Ok(BrushVfs::from_directory_handle(dir_handle).await?)
+                    Ok(Arc::new(BrushVfs::from_directory_handle(dir_handle).await?))
                 }
             }
             Self::Url(url) => Self::fetch_url(url).await,
             #[cfg(not(target_family = "wasm"))]
-            Self::Path(path) => Ok(BrushVfs::from_path(Path::new(&path)).await?),
+            Self::Path(path) => Ok(Arc::new(BrushVfs::from_path(Path::new(&path)).await?)),
             #[cfg(target_family = "wasm")]
             Self::Path(_) => {
                 panic!("Cannot load from filesystem path on WASM");
             }
+            #[cfg(target_family = "wasm")]
+            Self::PickedDirectory(handle, _) => {
+                Ok(Arc::new(BrushVfs::from_directory_handle(handle).await?))
+            }
         }
     }
 
-    async fn fetch_url(url: String) -> Result<BrushVfs, DataSourceError> {
+    async fn fetch_url(url: String) -> Result<Arc<BrushVfs>, DataSourceError> {
         let mut url = url.clone();
 
         if url.starts_with("https://") || url.starts_with("http://") {
@@ -102,10 +130,31 @@ impl DataSource {
             use tokio_stream::StreamExt;
             use tokio_util::io::StreamReader;
 
-            let response = reqwest::get(url).await?.bytes_stream();
-            let response = response.map(|b| b.map_err(|_e| std::io::ErrorKind::ConnectionAborted));
-            let reader = StreamReader::new(response);
-            Ok(BrushVfs::from_reader(reader).await?)
+            let response = reqwest::get(&url).await?;
+
+            // Try to get filename from Content-Disposition header, fall back to URL
+            let name = response
+                .headers()
+                .get(reqwest::header::CONTENT_DISPOSITION)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| {
+                    // Parse "attachment; filename=\"name.ply\"" or "filename=name.ply"
+                    s.split(';').find_map(|part| {
+                        let part = part.trim();
+                        if part.starts_with("filename=") {
+                            let name = part.trim_start_matches("filename=");
+                            Some(name.trim_matches('"').to_owned())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .or_else(|| url.rsplit('/').next().map(String::from));
+
+            let stream = response.bytes_stream();
+            let stream = stream.map(|b| b.map_err(|_e| std::io::ErrorKind::ConnectionAborted));
+            let reader = StreamReader::new(stream);
+            Ok(Arc::new(BrushVfs::from_reader(reader, name).await?))
         }
 
         #[cfg(target_family = "wasm")]
@@ -120,20 +169,19 @@ impl DataSource {
             opts.set_mode(RequestMode::Cors);
 
             let request = Request::new_with_str_and_init(&url, &opts).map_err(|e| {
-                DataSourceError::FetchError(format!("Failed to create request: {:?}", e))
+                DataSourceError::FetchError(format!("Failed to create request: {e:?}"))
             })?;
 
-            let window = web_sys::window().ok_or_else(|| {
-                DataSourceError::FetchError("No window object available".to_string())
-            })?;
+            let window = web_sys::window()
+                .ok_or_else(|| DataSourceError::FetchError("No window object available".into()))?;
 
             let resp_value =
                 wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&request))
                     .await
-                    .map_err(|e| DataSourceError::FetchError(format!("Fetch failed: {:?}", e)))?;
+                    .map_err(|e| DataSourceError::FetchError(format!("Fetch failed: {e:?}")))?;
 
             let resp: Response = resp_value.dyn_into().map_err(|e| {
-                DataSourceError::FetchError(format!("Failed to cast to Response: {:?}", e))
+                DataSourceError::FetchError(format!("Failed to cast to Response: {e:?}"))
             })?;
 
             if !resp.ok() {
@@ -143,14 +191,34 @@ impl DataSource {
                 )));
             }
 
+            // Try to get filename from Content-Disposition header, fall back to URL
+            let name = resp
+                .headers()
+                .get("Content-Disposition")
+                .ok()
+                .flatten()
+                .and_then(|s| {
+                    // Parse "attachment; filename=\"name.ply\"" or "filename=name.ply"
+                    s.split(';').find_map(|part| {
+                        let part = part.trim();
+                        if part.starts_with("filename=") {
+                            let name = part.trim_start_matches("filename=");
+                            Some(name.trim_matches('"').to_owned())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .or_else(|| url.rsplit('/').next().map(String::from));
+
             let body = resp
                 .body()
-                .ok_or_else(|| DataSourceError::FetchError("Response has no body".to_string()))?;
+                .ok_or_else(|| DataSourceError::FetchError("Response has no body".into()))?;
 
             let readable_stream = ReadableStream::from_raw(body);
             let async_read = readable_stream.into_async_read().compat();
             let async_read = BufReader::new(async_read);
-            Ok(BrushVfs::from_reader(async_read).await?)
+            Ok(Arc::new(BrushVfs::from_reader(async_read, name).await?))
         }
     }
 }

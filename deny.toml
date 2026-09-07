@@ -19,15 +19,22 @@ targets = [
     { triple = "aarch64-linux-android" },
 ]
 all-features = true
+# One-off LPIPS weight-conversion tool - don't really mind deps of it and
+# it pulls in a ton of stuff through the pytorch feature.
+exclude = ["lpips-convert"]
 
 [advisories]
 version = 2
 ignore = [
     # Paste is unmaintained, used by Cube and rerun, wait for them to upgrade.
     "RUSTSEC-2024-0436",
+    # ttf-parser is unmaintained, used transitively by winit.
+    "RUSTSEC-2026-0192",
 ]
 
 [bans]
+# Keep flate2 at 1.1.9 in Cargo.lock: 1.1.10 adds a second miniz_oxide version.
+# After updating dependencies, run `cargo update -p flate2 --precise 1.1.9`.
 multiple-versions = "deny"
 deny = [
     { name = "openssl-sys", reason = "Use rustls" },
@@ -39,11 +46,30 @@ skip = [
     { name = "bitflags" },
     { name = 'itertools' },
     { name = 'getrandom' },
-    { name = 'syn' },
+    { name = 'rand' },
+    { name = 'rand_core' },
+    { name = 'env_filter' },
+
+    { name = 'darling_macro' },
+    { name = 'darling' },
+    { name = 'darling_core' },
+
+    { name = 'cpufeatures' },
 
     { name = 'thiserror' },
     { name = 'thiserror-impl' },
-    { name = 'unicode-width' },
+
+    # syn 2 -> 3 ecosystem transition (async-trait is on 3, most derives on 2).
+    { name = 'syn' },
+
+    # pliron (via cubecl) is on downcast-rs 2, wayland-backend still on 1.
+    { name = 'downcast-rs' },
+
+    # rerun's re_auth is on base64 0.23, arrow/reqwest/tonic still on 0.22.
+    { name = 'base64' },
+
+    # eframe 0.36 moved to pollster 1.0, rfd (latest 0.17.2) still on 0.4.
+    { name = 'pollster' },
 
     # Other
     { name = "core-foundation" },     # Egui has two?
@@ -52,41 +78,24 @@ skip = [
     { name = 'windows-targets' },     # Old version from winit.
     { name = 'windows-sys' },         # Old version from winit.
 
-    { name = 'windows-core' },      # Wgpu & rerun
-    { name = 'windows-strings' },   # Wgpu & rerun
-    { name = 'windows-result' },    # Wgpu & rerun
-    { name = 'windows-interface' }, # Wgpu & rerun
-    { name = 'windows-implement' }, # Wgpu & rerun
-
     { name = 'rustix' },        # Winit & clap
     { name = 'linux-raw-sys' }, # Winit & clap
 
-    { name = 'objc2-foundation' }, # eframe & rfd
     { name = 'block2' },           # eframe & rfd
-    { name = 'objc2-app-kit' },    # eframe & rfd
     { name = 'objc2' },            # eframe & rfd
-    { name = 'windows' },          # Wgpu & kiddo
+    { name = 'objc2-app-kit' },    # eframe & rfd
+    { name = 'objc2-foundation' }, # eframe & rfd
 
     { name = 'hashbrown' },
     { name = "rustc-hash" },
-    { name = "core-graphics-types" },
-
     { name = "smithay-client-toolkit" },
     { name = "foldhash" },
-
-    { name = "emath" },
     { name = "calloop-wayland-source" },
     { name = "calloop" },
-
-    { name = "zune-jpeg" },
-    { name = "zune-core" },
-    { name = "webpki-roots" },
-
     { name = "convert_case" },
-
-    # Older versions in rerun.
-    { name = "prettyplease" },
     { name = "console" },
+    { name = "jni-sys" },
+    { name = "wasm-streams" },
 ]
 
 [licenses]
@@ -107,7 +116,6 @@ allow = [
     "Unlicense",                      # https://www.tldrlegal.com/license/unlicense
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
-    "bzip2-1.0.6",
 ]
 
 [[licenses.clarify]]

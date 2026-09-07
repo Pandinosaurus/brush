@@ -1,11 +1,34 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "examples/*"]
-default-members = ["crates/brush-app"]
+members = [
+    "apps/brush-app",
+    "apps/brush-c",
+    "apps/brush-cli",
+    "apps/brush-js",
+    "crates/brush-async",
+    "crates/brush-bench-test",
+    "crates/brush-cube",
+    "crates/brush-dataset",
+    "crates/brush-loss",
+    "crates/brush-prefix-sum",
+    "crates/brush-process",
+    "crates/brush-render",
+    "crates/brush-rerun",
+    "crates/brush-serde",
+    "crates/brush-serde-macros",
+    "crates/brush-sort",
+    "crates/brush-train",
+    "crates/brush-vfs",
+    "crates/colmap-reader",
+    "crates/lpips",
+    "crates/lpips-convert",
+    "crates/rrfd",
+]
+default-members = ["apps/brush-app"]
 
 [workspace.package]
 edition = "2024"
-version = "0.3.0"
+version = "1.0.0"
 readme = "README.md"
 license = "Apache-2.0"
 repository = "https://github.com/ArthurBrussee/brush"
@@ -19,6 +42,9 @@ image = { version = "0.25", default-features = false, features = [
     "jpeg",
     'exr'
 ] }
+# Direct dep alongside `image` — only this crate exposes IDCT scale-on-decode,
+# which lets us decode large JPEGs at 1/2, 1/4, or 1/8 size.
+jpeg-decoder = "0.3"
 
 serde = { version = "1.0.215", default-features = false, features = [
     "derive",
@@ -26,111 +52,89 @@ serde = { version = "1.0.215", default-features = false, features = [
 ] }
 serde_json = { version = "1.0.133", default-features = false }
 
-rand = "0.9.0"
+rand = "0.10.0"
 tracing = "0.1.41"
 tracing-tracy = "0.11.3"
 tracing-subscriber = "0.3.19"
 
-winapi = "0.3"
+winapi = { version = "0.3", features = ["wincon"] }
 
 tokio = { version = "1.42.0", default-features = false }
-tokio_with_wasm = "0.8.2"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7.13", features = ["io"] }
+async-channel = "2.5.0"
 
 anyhow = "1.0.94"
 thiserror = "2.0"
 
-reqwest = { version = "0.12.9", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
     "stream",
-    "rustls-tls",
 ] }
 
 indicatif = "0.18"
 env_logger = "0.11"
 clap = { version = "4.5.23", features = ["derive"] }
+parse-size = "1.1"
 
 web-time = "1.1.0"
 humantime = "2.1.0"
 async-fn-stream = "0.3"
-miette = { version = "7.4.0", features = ["fancy"] }
 assert_approx_eq = "1.1.0"
-safetensors = "0.7"
+safetensors = "0.8"
 log = "0.4.22"
 wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0.4"
-wasm-streams = "0.4"
+wasm-streams = "0.6"
 
 rayon = "1.11"
 
-naga_oil = { version = "0.19", default-features = false }
-
 # Backends are chosen per platform.
-wgpu = { version = "26", default-features = false, features = ["naga-ir"] }
+wgpu = { version = "30", default-features = false, features = ["naga-ir"] }
 
 serde-ply = "0.2.1"
 
-burn = { git = "https://github.com/tracel-ai/burn", features = [
-    'wgpu',
-    'autodiff',
+# `default-features = false` re-lists burn's default set minus `rl`: burn-rl
+# enables `burn-core/dataset`, which pulls gix-tempfile -> signal-hook-registry
+# -> errno, none of which compile for wasm32. Brush has its own dataset stack
+# and no RL, so dropping `rl` keeps the wasm build green.
+burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = [
+    'std',
+    'optim',
+    'extension',
+    'cubecl',
 ] }
-burn-cubecl = { git = "https://github.com/tracel-ai/burn" }
-burn-ir = { git = "https://github.com/tracel-ai/burn" }
-burn-wgpu = { git = "https://github.com/tracel-ai/burn", features = [
+burn-cubecl = { git = "https://github.com/tracel-ai/burn", branch = "main" }
+burn-ir = { git = "https://github.com/tracel-ai/burn", branch = "main" }
+burn-wgpu = { git = "https://github.com/tracel-ai/burn", branch = "main", features = [
     "exclusive-memory-only",
 ] }
-burn-fusion = { git = "https://github.com/tracel-ai/burn" }
-burn-import = { git = "https://github.com/tracel-ai/burn", default-features = false, features = [
-    "pytorch",
-] }
+burn-fusion = { git = "https://github.com/tracel-ai/burn", branch = "main" }
+# `pytorch` is only needed by lpips-convert (one-off weight conversion tool).
+# Enabled there directly so the main graph doesn't grow `zip 8` and its newer
+# crypto family (digest 0.11, hmac 0.13, ...).
+burn-store = { git = "https://github.com/tracel-ai/burn", branch = "main" }
 
-egui = { version = "0.32"  }
-eframe = { version = "0.32", default-features = false, features = [
+egui = { version = "0.36" }
+eframe = { version = "0.36", default-features = false, features = [
     "wgpu",
     "android-game-activity",
     "wayland",
     "x11",
+    "persistence",
 ] }
 
-egui_tiles = "0.13.0"
+egui_tiles = { version = "0.17", features = ["serde"] }
 
-rerun = { version = "0.27", default-features = false, features = [
+rerun = { version = "0.36", default-features = false, features = [
     'sdk',
     'glam',
 ] }
 
 ball-tree = "0.5.1"
-
 web-sys = { version = "0.3.74" }
 async_zip = { version = "0.0.18", default-features = false, features = ["tokio", "deflate"] }
 hashbrown = "0.16"
-parking_lot = "0.12"
 alphanumeric-sort = "1.5.3"
-
-# Uncomment this to use local burn/cubecl.
-# [patch."https://github.com/tracel-ai/burn"]
-# burn = { path = "../burn/crates/burn" }
-# burn-cubecl = { path = "../burn/crates/burn-cubecl" }
-# burn-wgpu = { path = "../burn/crates/burn-wgpu" }
-# burn-fusion = { path = "../burn/crates/burn-fusion" }
-# burn-ir = { path = "../burn/crates/burn-ir" }
-# burn-import = { path = "../burn/crates/burn-import" }
-
-# [patch."https://github.com/tracel-ai/cubecl"]
-# cubecl = { path = "../cubecl/crates/cubecl" }
-# cubecl-common = { path = "../cubecl/crates/cubecl-common" }
-# cubecl-std = { path = "../cubecl/crates/cubecl-std" }
-# cubecl-core = { path = "../cubecl/crates/cubecl-core" }
-# cubecl-runtime = { path = "../cubecl/crates/cubecl-runtime" }
-# cubecl-quant = { path = "../cubecl/crates/cubecl-quant" }
-
-[patch.crates-io]
-wgpu = { git = "https://github.com/ArthurBrussee/wgpu", branch = "v26" }
-naga = { git = "https://github.com/ArthurBrussee/wgpu", branch = "v26" }
-
-egui = { git = "https://github.com/emilk/egui", rev = "c97c065a575ec6e657bb42872890a00d0fb391c1"  }
-eframe = { git = "https://github.com/emilk/egui", rev = "c97c065a575ec6e657bb42872890a00d0fb391c1" }
-emath = { git = "https://github.com/emilk/egui", rev = "c97c065a575ec6e657bb42872890a00d0fb391c1" }
 
 # Uncomment this to use local wgpu and naga.
 # wgpu.path = "../wgpu/wgpu"
@@ -141,11 +145,13 @@ opt-level = 1
 # Reduce debuginfo for faster linking
 debug = 1
 
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
+# No debuginfo for dependencies: they're rarely stepped into, and dropping it
+# cuts link time and target-dir size noticeably (workspace crates keep theirs).
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
 lto = "thin"
-# debug = true # good for profilers
 
 [workspace.lints.rust]
 future_incompatible = { level = "warn", priority = -1 }
@@ -171,7 +177,6 @@ debug_assert_with_mut_call = "warn"
 derive_partial_eq_without_eq = "warn"
 doc_link_with_quotes = "warn"
 doc_markdown = "warn"
-empty_enum = "warn"
 empty_enum_variants_with_brackets = "warn"
 enum_glob_use = "warn"
 equatable_if_let = "warn"
@@ -270,7 +275,6 @@ todo = "warn"
 trailing_empty_array = "warn"
 trait_duplication_in_bounds = "warn"
 tuple_array_conversions = "warn"
-unchecked_duration_subtraction = "warn"
 undocumented_unsafe_blocks = "warn"
 unimplemented = "warn"
 uninhabited_references = "warn"
@@ -321,13 +325,10 @@ needless_range_loop = "allow"
 # This doesn't quite work with Burn:
 single_range_in_vec_init = "allow"
 
-# NOTE: This is a temporary workaround for macOS tahoe, and xcode 16.4+.
-# Some requirement for FFI has changed, and macOS crashes because of a
-# sign mismatch ("expected return to have type code 'q', but found 'Q'")
-# This workaround disables the problematic check entirely.
-# objc2 0.6+ has a better workaround that only disables sign conversion
-# checks, see https://github.com/madsmtm/objc2/issues/765#issuecomment-2996136843,
-# and new winit versions are enabling this by default: https://github.com/madsmtm/objc2/issues/765.
-# When that has landed and Bevy has updated to a new winit version this workaround should be removed.
-[profile.dev.package.objc2]
-debug-assertions = false
+# WebGPU subgroup support, JS handle interop, and error-scope fixes on wgpu 30.0.1.
+[patch.crates-io]
+wgpu                 = { git = "https://github.com/ArthurBrussee/wgpu", branch = "fix/webgpu-errors-v30.0.1" }
+wgpu-core            = { git = "https://github.com/ArthurBrussee/wgpu", branch = "fix/webgpu-errors-v30.0.1" }
+wgpu-hal             = { git = "https://github.com/ArthurBrussee/wgpu", branch = "fix/webgpu-errors-v30.0.1" }
+wgpu-types           = { git = "https://github.com/ArthurBrussee/wgpu", branch = "fix/webgpu-errors-v30.0.1" }
+naga                 = { git = "https://github.com/ArthurBrussee/wgpu", branch = "fix/webgpu-errors-v30.0.1" }

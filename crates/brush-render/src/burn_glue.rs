@@ -1,195 +1,276 @@
-use burn::tensor::{DType, Shape, ops::FloatTensor};
-use burn_cubecl::{BoolElement, fusion::FusionCubeRuntime};
+#![allow(clippy::match_wildcard_for_single_variants)]
+
+use brush_cube::{MainBackend, MainBackendBase};
+use burn::backend::{
+    Autodiff, BackendTensor, DispatchAutodiffContext, DispatchTensor, DispatchTensorKind,
+    GradientCheckpointingStrategy, TensorMetadata,
+    tensor::{FloatTensor, IntTensor},
+};
+use burn::tensor::{DType, Int, Tensor};
+use burn_cubecl::fusion::FusionCubeRuntime;
+use burn_cubecl::tensor::CubeTensor;
 use burn_fusion::{
-    Fusion, FusionHandle,
-    stream::{Operation, OperationStreams},
+    ExecutionError, Fusion, FusionHandle,
+    stream::{Operation, StreamId},
 };
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
-use burn_wgpu::WgpuRuntime;
 use glam::Vec3;
 
 use crate::{
-    MainBackendBase, SplatForward,
-    camera::Camera,
-    render::{calc_tile_bounds, max_intersections, render_forward},
-    render_aux::RenderAux,
-    shaders,
+    RenderAuxInner, SplatOps, backend_kind, camera::Camera, gaussian_splats::SplatRenderMode,
+    render_aux::RenderOutput,
 };
+use burn_cubecl::CubeBackend;
 
-// Implement forward functions for the inner wgpu backend.
-impl SplatForward<Self> for MainBackendBase {
-    fn render_splats(
-        camera: &Camera,
-        img_size: glam::UVec2,
-        means: FloatTensor<Self>,
-        log_scales: FloatTensor<Self>,
-        quats: FloatTensor<Self>,
-        sh_coeffs: FloatTensor<Self>,
-        opacity: FloatTensor<Self>,
-        background: Vec3,
-        bwd_info: bool,
-    ) -> (FloatTensor<Self>, RenderAux<Self>) {
-        render_forward(
-            camera, img_size, means, log_scales, quats, sh_coeffs, opacity, background, bwd_info,
-        )
+/// Inner Wgpu autodiff backend (same as `Autodiff<burn::backend::Wgpu>`).
+/// Used as the primitive backend for autodiff `Tensor<D>` operations.
+pub type AutodiffMain = Autodiff<MainBackend>;
+
+// ---------------------------------------------------------------------------
+// `Tensor<D>` ↔ backend-level primitive bridges.
+//
+// `Tensor<D>` is pinned to burn's `Dispatch` backend; brush only ever runs on
+// a wgpu device, so every helper here assumes a `DispatchTensorKind::Cube`
+// (optionally wrapped in `Autodiff`) and panics otherwise. The forward render
+// now goes through the `#[backend_extension]`-generated `Dispatch` impl
+// instead; these stay for the hand-rolled backward path (brush-render-bwd)
+// and the LPIPS custom ops (brush-loss).
+// ---------------------------------------------------------------------------
+
+/// Extract the inner fusion-Wgpu float tensor from a non-autodiff
+/// `Tensor<D>`.
+pub fn unwrap_wgpu_float<const D: usize>(t: Tensor<D>) -> FloatTensor<MainBackend> {
+    let dispatch: DispatchTensor = t.into_dispatch();
+    match dispatch.kind {
+        backend_kind!(bt) => bt.float(),
+        other => panic!(
+            "expected Wgpu tensor, got: {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 }
 
-impl SplatForward<Self> for Fusion<MainBackendBase> {
-    fn render_splats(
-        cam: &Camera,
+/// Extract the inner fusion-Wgpu int tensor from a non-autodiff
+/// `Tensor<D, Int>`.
+pub fn unwrap_wgpu_int<const D: usize>(t: Tensor<D, Int>) -> IntTensor<MainBackend> {
+    let dispatch: DispatchTensor = t.into_dispatch();
+    match dispatch.kind {
+        backend_kind!(bt) => bt.int(),
+        other => panic!(
+            "expected Wgpu int tensor, got: {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+}
+
+/// Inverse of [`unwrap_wgpu_float`]: wraps a fusion-Wgpu float tensor as a
+/// user-facing `Tensor<D>`.
+pub fn wrap_wgpu_float<const D: usize>(t: FloatTensor<MainBackend>) -> Tensor<D> {
+    Tensor::from_dispatch(DispatchTensor {
+        kind: backend_kind!(BackendTensor::Float(t)),
+        autodiff: DispatchAutodiffContext::Disabled,
+    })
+}
+
+/// Extract the inner `AutodiffTensor<MainBackend>` from a `Tensor<D>` on an
+/// autodiff-enabled Wgpu device. Panics on any other shape.
+pub fn unwrap_ad_wgpu_float<const D: usize>(t: Tensor<D>) -> FloatTensor<AutodiffMain> {
+    let prim: DispatchTensor = t.into_dispatch();
+    match prim.kind {
+        DispatchTensorKind::Autodiff(inner) => match *inner {
+            backend_kind!(BackendTensor::Autodiff(t)) => t,
+            other => panic!(
+                "autodiff inner kind is not Wgpu: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        },
+        other => panic!(
+            "expected autodiff-enabled tensor; got: {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+}
+
+/// Extract the inner Wgpu `IntTensor` regardless of whether the tensor is
+/// wrapped in an autodiff device — ints are never autodiff-tracked.
+pub fn unwrap_ad_wgpu_int<const D: usize>(t: Tensor<D, Int>) -> IntTensor<MainBackend> {
+    let dispatch: DispatchTensor = t.into_dispatch();
+    let kind = match dispatch.kind {
+        DispatchTensorKind::Autodiff(inner) => *inner,
+        other => other,
+    };
+    match kind {
+        backend_kind!(bt) => bt.int(),
+        other => panic!(
+            "expected Wgpu int tensor; got: {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+}
+
+/// Inverse of [`unwrap_ad_wgpu_float`]: wraps an autodiff tensor as a
+/// user-facing `Tensor<D>` on the autodiff device.
+pub fn wrap_ad_wgpu_float<const D: usize>(t: FloatTensor<AutodiffMain>) -> Tensor<D> {
+    Tensor::from_dispatch(DispatchTensor {
+        kind: DispatchTensorKind::Autodiff(Box::new(backend_kind!(BackendTensor::Autodiff(t)))),
+        autodiff: DispatchAutodiffContext::Enabled(GradientCheckpointingStrategy::Disabled),
+    })
+}
+
+fn is_autodiff<const D: usize>(t: &Tensor<D>) -> bool {
+    matches!(
+        t.clone().into_dispatch().kind,
+        DispatchTensorKind::Autodiff(_)
+    )
+}
+
+/// Put `t` on the same autodiff/inner backend variant as `reference`. Brush
+/// keeps some frozen tensors (e.g. the 3D-filter floor) on the inner backend
+/// but folds them against params that may be lifted to autodiff; this aligns
+/// both operands so dispatch ops don't trip a cross-backend assertion.
+pub(crate) fn match_backend<const D: usize, const DR: usize>(
+    t: Tensor<D>,
+    reference: &Tensor<DR>,
+) -> Tensor<D> {
+    if is_autodiff(reference) {
+        t.autodiff()
+    } else {
+        t.without_autodiff()
+    }
+}
+
+/// Resolve pending fusion operations and return the underlying tensor.
+pub fn resolve_to_cube_float<const D: usize>(tensor: Tensor<D>) -> CubeTensor {
+    let fusion = unwrap_wgpu_float(tensor);
+    let client = fusion.client.clone();
+    client.resolve_tensor_float::<MainBackendBase>(fusion)
+}
+
+impl SplatOps for Fusion<CubeBackend> {
+    async fn render(
+        camera: &Camera,
         img_size: glam::UVec2,
-        means: FloatTensor<Self>,
-        log_scales: FloatTensor<Self>,
-        quats: FloatTensor<Self>,
+        transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
-        opacity: FloatTensor<Self>,
+        raw_opacities: FloatTensor<Self>,
+        refine_weight: FloatTensor<Self>,
+        render_mode: SplatRenderMode,
         background: Vec3,
-        bwd_info: bool,
-    ) -> (FloatTensor<Self>, RenderAux<Self>) {
+        pass: crate::gaussian_splats::RasterPass,
+    ) -> RenderOutput<Self> {
+        let client = transforms.client.clone();
+
+        // Resolve fusion inputs to MainBackendBase tensors. This
+        // drains any pending fusion operations into a concrete buffer.
+        let base_transforms = client
+            .clone()
+            .resolve_tensor_float::<CubeBackend>(transforms);
+        let base_sh_coeffs = client
+            .clone()
+            .resolve_tensor_float::<CubeBackend>(sh_coeffs);
+        let base_raw_opac = client
+            .clone()
+            .resolve_tensor_float::<CubeBackend>(raw_opacities);
+        let base_refine_weight = client
+            .clone()
+            .resolve_tensor_float::<CubeBackend>(refine_weight);
+
+        let out = <CubeBackend as SplatOps>::render(
+            camera,
+            img_size,
+            base_transforms,
+            base_sh_coeffs,
+            base_raw_opac,
+            base_refine_weight,
+            render_mode,
+            background,
+            pass,
+        )
+        .await;
+
+        // Bind precomputed outputs back into the fusion stream.
         #[derive(Debug)]
-        struct CustomOp {
-            cam: Camera,
-            img_size: glam::UVec2,
-            bwd_info: bool,
-            background: Vec3,
+        struct BindOp {
             desc: CustomOpIr,
+            out_img: FloatTensor<CubeBackend>,
+            visible: FloatTensor<CubeBackend>,
+            max_radius: FloatTensor<CubeBackend>,
+            projected_splats: FloatTensor<CubeBackend>,
+            tile_offsets: IntTensor<CubeBackend>,
+            compact_gid_from_isect: IntTensor<CubeBackend>,
+            global_from_compact_gid: IntTensor<CubeBackend>,
         }
 
-        impl<BT: BoolElement> Operation<FusionCubeRuntime<WgpuRuntime, BT>> for CustomOp {
+        impl Operation<FusionCubeRuntime> for BindOp {
             fn execute(
                 &self,
-                h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime, BT>>>,
-            ) {
-                let (inputs, outputs) = self.desc.as_fixed();
-
-                let [means, log_scales, quats, sh_coeffs, opacity] = inputs;
+                h: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+            ) -> Result<(), ExecutionError> {
+                let (_, outputs) = self.desc.as_fixed::<0, 7>();
                 let [
-                    // Img
                     out_img,
-                    // Aux
+                    visible,
+                    max_radius,
                     projected_splats,
-                    uniforms_buffer,
-                    num_intersections,
                     tile_offsets,
                     compact_gid_from_isect,
                     global_from_compact_gid,
-                    visible,
                 ] = outputs;
 
-                let (img, aux) = MainBackendBase::render_splats(
-                    &self.cam,
-                    self.img_size,
-                    h.get_float_tensor::<MainBackendBase>(means),
-                    h.get_float_tensor::<MainBackendBase>(log_scales),
-                    h.get_float_tensor::<MainBackendBase>(quats),
-                    h.get_float_tensor::<MainBackendBase>(sh_coeffs),
-                    h.get_float_tensor::<MainBackendBase>(opacity),
-                    self.background,
-                    self.bwd_info,
-                );
-
-                // Register output.
-                h.register_float_tensor::<MainBackendBase>(&out_img.id, img);
-                h.register_float_tensor::<MainBackendBase>(
+                h.register_float_tensor::<CubeBackend>(&out_img.id, self.out_img.clone());
+                h.register_float_tensor::<CubeBackend>(&visible.id, self.visible.clone());
+                h.register_float_tensor::<CubeBackend>(&max_radius.id, self.max_radius.clone());
+                h.register_float_tensor::<CubeBackend>(
                     &projected_splats.id,
-                    aux.projected_splats,
+                    self.projected_splats.clone(),
                 );
-                h.register_int_tensor::<MainBackendBase>(&uniforms_buffer.id, aux.uniforms_buffer);
-                h.register_int_tensor::<MainBackendBase>(
-                    &num_intersections.id,
-                    aux.num_intersections,
-                );
-                h.register_int_tensor::<MainBackendBase>(&tile_offsets.id, aux.tile_offsets);
-                h.register_int_tensor::<MainBackendBase>(
+                h.register_int_tensor::<CubeBackend>(&tile_offsets.id, self.tile_offsets.clone());
+                h.register_int_tensor::<CubeBackend>(
                     &compact_gid_from_isect.id,
-                    aux.compact_gid_from_isect,
+                    self.compact_gid_from_isect.clone(),
                 );
-                h.register_int_tensor::<MainBackendBase>(
+                h.register_int_tensor::<CubeBackend>(
                     &global_from_compact_gid.id,
-                    aux.global_from_compact_gid,
+                    self.global_from_compact_gid.clone(),
                 );
-
-                h.register_float_tensor::<MainBackendBase>(&visible.id, aux.visible);
+                Ok(())
             }
         }
 
-        let client = means.client.clone();
+        // Every output is a fresh handle the bind op fills in; only shape and
+        // dtype differ.
+        let new_out = |shape, dtype| TensorIr::uninit(client.create_empty_handle(), shape, dtype);
+        let out_img_ir = new_out(out.out_img.shape(), DType::F32);
+        let visible_ir = new_out(out.aux.visible.shape(), DType::F32);
+        let max_radius_ir = new_out(out.aux.max_radius.shape(), DType::F32);
+        let projected_splats_ir = new_out(out.projected_splats.shape(), DType::F32);
+        let tile_offsets_ir = new_out(out.aux.tile_offsets.shape(), DType::U32);
+        let compact_gid_from_isect_ir = new_out(out.compact_gid_from_isect.shape(), DType::U32);
+        let global_from_compact_gid_ir = new_out(out.global_from_compact_gid.shape(), DType::U32);
 
-        let num_points = means.shape[0];
-
-        let proj_size = size_of::<shaders::helpers::ProjectedSplat>() / 4;
-        let uniforms_size = size_of::<shaders::helpers::RenderUniforms>() / 4;
-        let tile_bounds = calc_tile_bounds(img_size);
-        let max_intersects = max_intersections(img_size, num_points as u32);
-
-        // If render_u32_buffer is true, we render a packed buffer of u32 values, otherwise
-        // render RGBA f32 values.
-        let channels = if bwd_info { 4 } else { 1 };
-
-        let out_img = TensorIr::uninit(
-            client.create_empty_handle(),
-            Shape::new([img_size.y as usize, img_size.x as usize, channels]),
-            if bwd_info { DType::F32 } else { DType::U32 },
-        );
-
-        let visible_shape = if bwd_info {
-            Shape::new([num_points])
-        } else {
-            Shape::new([1])
-        };
-
-        let projected_splats = TensorIr::uninit(
-            client.create_empty_handle(),
-            Shape::new([num_points, proj_size]),
-            DType::F32,
-        );
-        let uniforms_buffer = TensorIr::uninit(
-            client.create_empty_handle(),
-            Shape::new([uniforms_size]),
-            DType::U32,
-        );
-        let num_intersections =
-            TensorIr::uninit(client.create_empty_handle(), Shape::new([1]), DType::U32);
-        let tile_offsets = TensorIr::uninit(
-            client.create_empty_handle(),
-            Shape::new([tile_bounds.y as usize, tile_bounds.x as usize, 2]),
-            DType::U32,
-        );
-        let compact_gid_from_isect = TensorIr::uninit(
-            client.create_empty_handle(),
-            Shape::new([max_intersects as usize]),
-            DType::U32,
-        );
-        let global_from_compact_gid = TensorIr::uninit(
-            client.create_empty_handle(),
-            Shape::new([num_points]),
-            DType::U32,
-        );
-        let visible = TensorIr::uninit(client.create_empty_handle(), visible_shape, DType::F32);
-
-        let input_tensors = [means, log_scales, quats, sh_coeffs, opacity];
-        let stream = OperationStreams::with_inputs(&input_tensors);
+        let stream = StreamId::current();
         let desc = CustomOpIr::new(
-            "render_splats",
-            &input_tensors.map(|t| t.into_ir()),
+            "render_bind",
+            &[],
             &[
-                out_img,
-                projected_splats,
-                uniforms_buffer,
-                num_intersections,
-                tile_offsets,
-                compact_gid_from_isect,
-                global_from_compact_gid,
-                visible,
+                out_img_ir,
+                visible_ir,
+                max_radius_ir,
+                projected_splats_ir,
+                tile_offsets_ir,
+                compact_gid_from_isect_ir,
+                global_from_compact_gid_ir,
             ],
         );
-        let op = CustomOp {
-            cam: cam.clone(),
-            img_size,
-            bwd_info,
-            background,
+        let op = BindOp {
             desc: desc.clone(),
+            out_img: out.out_img,
+            visible: out.aux.visible,
+            max_radius: out.aux.max_radius,
+            projected_splats: out.projected_splats,
+            tile_offsets: out.aux.tile_offsets,
+            compact_gid_from_isect: out.compact_gid_from_isect,
+            global_from_compact_gid: out.global_from_compact_gid,
         };
 
         let outputs = client
@@ -197,30 +278,29 @@ impl SplatForward<Self> for Fusion<MainBackendBase> {
             .outputs();
 
         let [
-            // Img
             out_img,
-            // Aux
+            visible,
+            max_radius,
             projected_splats,
-            uniforms_buffer,
-            num_intersections,
             tile_offsets,
             compact_gid_from_isect,
             global_from_compact_gid,
-            visible,
         ] = outputs;
 
-        (
+        RenderOutput {
             out_img,
-            RenderAux::<Self> {
-                projected_splats,
-                uniforms_buffer,
-                num_intersections,
-                tile_offsets,
-                compact_gid_from_isect,
-                global_from_compact_gid,
+            aux: RenderAuxInner {
+                num_visible: out.aux.num_visible,
+                num_intersections: out.aux.num_intersections,
                 visible,
-                img_size,
+                max_radius,
+                tile_offsets,
+                img_size: out.aux.img_size,
             },
-        )
+            projected_splats,
+            compact_gid_from_isect,
+            project_uniforms: out.project_uniforms,
+            global_from_compact_gid,
+        }
     }
 }

@@ -16,7 +16,6 @@ use tokio::{
     sync::Mutex,
 };
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
-use tokio_with_wasm::alias as tokio_wasm;
 
 pub use data_source::{DataSource, DataSourceError};
 
@@ -35,7 +34,7 @@ impl<T: AsyncBufRead + SendNotWasm + Unpin> DynRead for T {}
 
 type StreamingReader = Arc<Mutex<Option<Box<dyn DynRead>>>>;
 
-/// Wrapper so Cursor can use Arc<Vec<u8>> without cloning.
+/// Wrapper so `Cursor` can use `Arc<Vec<u8>>` without cloning.
 struct ArcVec(Arc<Vec<u8>>);
 impl AsRef<[u8]> for ArcVec {
     fn as_ref(&self) -> &[u8] {
@@ -58,7 +57,9 @@ impl PathKey {
     }
 
     fn from_path(path: &Path) -> Self {
-        Self::from_str(path.clean().to_str().expect("Invalid path"))
+        // Lossily convert rather than panicking on non-UTF-8 filenames; the key
+        // is only used for case-insensitive lookups.
+        Self::from_str(&path.clean().to_string_lossy())
     }
 }
 
@@ -69,13 +70,38 @@ async fn read_at_most<R: AsyncRead + Unpin>(reader: &mut R, limit: usize) -> io:
     Ok(buffer)
 }
 
+/// Read from `reader` in chunks of `chunk_size`, calling `parse` on everything
+/// read so far after each chunk. Returns the first `Some` value `parse` yields,
+/// without consuming the rest of the reader; returns `None` if the reader hits
+/// EOF before `parse` succeeds.
+pub async fn read_until_parsed<R, T>(
+    reader: &mut R,
+    chunk_size: usize,
+    mut parse: impl FnMut(&[u8]) -> Option<T>,
+) -> io::Result<Option<T>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = vec![];
+    let mut chunk = vec![0u8; chunk_size];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(value) = parse(&buf) {
+            return Ok(Some(value));
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+    }
+}
+
 enum VfsContainer {
     /// Raw data stored in memory (from zip files)
     InMemory {
         entries: HashMap<PathBuf, Arc<Vec<u8>>>,
     },
-    /// A single file being streamed (e.g., PLY from HTTP).
-    /// The reader can only be consumed once.
+    /// A single file being streamed. The reader can only be consumed once.
     Streaming { reader: StreamingReader },
     /// Native directory - reads from disk on demand
     #[cfg(not(target_family = "wasm"))]
@@ -122,7 +148,7 @@ pub enum VfsConstructError {
     #[error("I/O error while constructing BrushVfs.")]
     IoError(#[from] std::io::Error),
     #[error("Got a status page instead of content: \n\n {0}")]
-    InvalidHtml(String),
+    ReceivedHTML(String),
     #[error("Unknown data type. Only zip and ply files are supported")]
     UnknownDataType,
 }
@@ -136,17 +162,19 @@ impl BrushVfs {
         self.lookup.values().cloned()
     }
 
-    pub async fn from_reader(reader: impl DynRead + 'static) -> Result<Self, VfsConstructError> {
+    pub async fn from_reader(
+        mut reader: impl DynRead + 'static,
+        name: Option<String>,
+    ) -> Result<Self, VfsConstructError> {
         // Small hack to peek some bytes: Read them
         // and add them at the start again.
-        let mut data = BufReader::new(reader);
-        let peek = read_at_most(&mut data, 64).await?;
+        let peek = read_at_most(&mut reader, 64).await?;
         let mut reader: Box<dyn DynRead> =
-            Box::new(AsyncReadExt::chain(Cursor::new(peek.clone()), data));
+            Box::new(AsyncReadExt::chain(Cursor::new(peek.clone()), reader));
 
         if peek.starts_with(b"ply") {
             // For single PLY files, keep the reader for streaming
-            let path = PathBuf::from("input.ply");
+            let path = PathBuf::from(name.unwrap_or_else(|| "input.ply".to_owned()));
 
             Ok(Self {
                 lookup: lookup_from_paths(std::slice::from_ref(&path)),
@@ -169,7 +197,7 @@ impl BrushVfs {
                     zip_reader = entry.skip().await.map_err(zip_error)?;
                 }
 
-                tokio_wasm::task::yield_now().await;
+                brush_async::yield_now().await;
             }
 
             let path_bufs = entries.keys().cloned().collect::<Vec<_>>();
@@ -181,7 +209,7 @@ impl BrushVfs {
         } else if peek.starts_with(b"<!DOCTYPE html>") {
             let mut html = String::new();
             reader.read_to_string(&mut html).await?;
-            Err(VfsConstructError::InvalidHtml(html))
+            Err(VfsConstructError::ReceivedHTML(html))
         } else {
             Err(VfsConstructError::UnknownDataType)
         }
@@ -194,7 +222,8 @@ impl BrushVfs {
             // it's not really just a single path.
             let file = tokio::fs::File::open(dir).await?;
             let reader = BufReader::new(file);
-            Self::from_reader(reader).await
+            let name = dir.file_name().and_then(|n| n.to_str()).map(String::from);
+            Self::from_reader(reader, name).await
         } else {
             // Make a VFS with all files contained in the directory.
             async fn walk_dir(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
@@ -218,7 +247,7 @@ impl BrushVfs {
                             paths.push(path);
                         }
 
-                        tokio_wasm::task::yield_now().await;
+                        brush_async::yield_now().await;
                     }
                 }
                 Ok(paths)
@@ -239,11 +268,8 @@ impl BrushVfs {
         dir_handle: rrfd::wasm::DirectoryHandle,
     ) -> Result<Self, VfsConstructError> {
         // List all files in the directory
-        let paths = dir_handle.list_files().await.map_err(|_| {
-            VfsConstructError::IoError(io::Error::new(
-                io::ErrorKind::Other,
-                "Failed to list directory contents",
-            ))
+        let paths = dir_handle.list_files().await.map_err(|_e| {
+            VfsConstructError::IoError(io::Error::other("Failed to list directory contents"))
         })?;
 
         Ok(Self {
@@ -283,7 +309,21 @@ impl BrushVfs {
 
     pub async fn reader_at_path(&self, path: &Path) -> io::Result<Box<dyn DynRead>> {
         let key = PathKey::from_path(path);
-        let path = self.lookup.get(&key).ok_or_else(|| {
+
+        let resolved = self.lookup.get(&key).or_else(|| {
+            // Datasets (e.g. a NeRFStudio transforms.json) sometimes reference
+            // files by absolute path. If we loaded a directory and that path
+            // points inside it, strip the directory prefix and resolve it
+            // within the VFS. Files outside the VFS are never read.
+            let base = PathKey::from_path(&self.base_path()?);
+            let rel = key.0.strip_prefix(&base.0)?;
+            // Only a match on a path-component boundary counts.
+            rel.starts_with('/')
+                .then(|| self.lookup.get(&PathKey(rel.to_owned())))
+                .flatten()
+        });
+
+        let path = resolved.ok_or_else(|| {
             Error::new(
                 io::ErrorKind::NotFound,
                 format!("File not found: {}", path.display()),
@@ -293,11 +333,12 @@ impl BrushVfs {
         match &self.container {
             VfsContainer::InMemory { entries } => {
                 let data = entries.get(path).expect("Unreachable").clone();
-                Ok(Box::new(Cursor::new(ArcVec(data))))
+                let reader: Box<dyn DynRead> = Box::new(Cursor::new(ArcVec(data)));
+                Ok(reader)
             }
             VfsContainer::Streaming { reader } => {
                 // Streaming reader can only be consumed once
-                let reader = reader
+                let reader: Box<dyn DynRead> = reader
                     .lock()
                     .await
                     .take()
@@ -312,7 +353,8 @@ impl BrushVfs {
                     5 * 1024 * 1024,
                     tokio::fs::File::open(total_path).await?,
                 );
-                Ok(Box::new(file))
+                let reader: Box<dyn DynRead> = Box::new(file);
+                Ok(reader)
             }
             #[cfg(target_family = "wasm")]
             VfsContainer::Directory { dir_handle } => {
@@ -320,7 +362,7 @@ impl BrushVfs {
                 use tokio_util::io::StreamReader;
                 use wasm_bindgen::JsCast;
 
-                let file = dir_handle.get_file(path).await.map_err(|_| {
+                let file = dir_handle.get_file(path).await.map_err(|_e| {
                     Error::new(
                         io::ErrorKind::NotFound,
                         format!("File not found: {}", path.display()),
@@ -331,10 +373,10 @@ impl BrushVfs {
                     .into_stream()
                     .map(|result| {
                         result
-                            .map_err(|e| Error::new(io::ErrorKind::Other, format!("{e:?}")))
+                            .map_err(|e| Error::other(format!("{e:?}")))
                             .and_then(|chunk| {
                                 let array =
-                                    chunk.dyn_into::<js_sys::Uint8Array>().map_err(|_| {
+                                    chunk.dyn_into::<js_sys::Uint8Array>().map_err(|_e| {
                                         Error::new(io::ErrorKind::InvalidData, "Invalid chunk")
                                     })?;
                                 let mut data = vec![0u8; array.length() as usize];
@@ -343,7 +385,8 @@ impl BrushVfs {
                             })
                     });
 
-                Ok(Box::new(BufReader::new(StreamReader::new(stream))))
+                let reader: Box<dyn DynRead> = Box::new(BufReader::new(StreamReader::new(stream)));
+                Ok(reader)
             }
         }
     }
@@ -391,6 +434,10 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[cfg(target_family = "wasm")]
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     async fn create_test_zip() -> Vec<u8> {
         use async_zip::base::write::ZipFileWriter;
@@ -417,10 +464,12 @@ mod tests {
         buffer
     }
 
-    #[tokio::test]
+    #[wasm_bindgen_test(unsupported = tokio::test)]
     async fn test_zip_vfs_workflow() {
         let zip_data = create_test_zip().await;
-        let vfs = BrushVfs::from_reader(Cursor::new(zip_data)).await.unwrap();
+        let vfs = BrushVfs::from_reader(Cursor::new(zip_data), None)
+            .await
+            .unwrap();
         assert_eq!(vfs.file_count(), 2);
 
         let txt_files: Vec<_> = vfs.files_with_extension("txt").collect();
@@ -465,12 +514,62 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[tokio::test]
+    async fn test_absolute_path_resolves_within_directory() {
+        // Datasets sometimes reference files by absolute path (e.g. a
+        // NeRFStudio transforms.json). When the directory was loaded as a
+        // VFS, that absolute path should resolve to the file inside it.
+        let dir = std::env::temp_dir().join("brush_vfs_abs_test_dir");
+        tokio::fs::create_dir_all(dir.join("images")).await.unwrap();
+        tokio::fs::write(dir.join("images/cam.png"), b"image content")
+            .await
+            .unwrap();
+
+        let vfs = BrushVfs::from_path(&dir).await.unwrap();
+
+        // Sanity: relative access works.
+        let mut content = String::new();
+        vfs.reader_at_path(Path::new("images/cam.png"))
+            .await
+            .unwrap()
+            .read_to_string(&mut content)
+            .await
+            .unwrap();
+        assert_eq!(content, "image content");
+
+        // The absolute path (dir is absolute) resolves to the same file by
+        // stripping the loaded-directory prefix.
+        let abs = dir.join("images/cam.png");
+        assert!(abs.is_absolute());
+        let mut content = String::new();
+        vfs.reader_at_path(&abs)
+            .await
+            .unwrap()
+            .read_to_string(&mut content)
+            .await
+            .unwrap();
+        assert_eq!(content, "image content");
+
+        // An absolute path outside the loaded directory is NOT read.
+        let outside = std::env::temp_dir().join("brush_vfs_outside_secret.txt");
+        tokio::fs::write(&outside, b"secret").await.unwrap();
+        assert!(vfs.reader_at_path(&outside).await.is_err());
+
+        // An empty VFS has no prefix, so absolute paths never resolve.
+        assert!(BrushVfs::empty().reader_at_path(&abs).await.is_err());
+
+        tokio::fs::remove_file(&outside).await.unwrap();
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
     async fn test_format_detection_and_errors() {
         // Test PLY format
-        let vfs = BrushVfs::from_reader(Cursor::new(
-            b"ply\nformat ascii 1.0\nend_header\nvertex data",
-        ))
+        let vfs = BrushVfs::from_reader(
+            Cursor::new(b"ply\nformat ascii 1.0\nend_header\nvertex data"),
+            None,
+        )
         .await
         .unwrap();
         let mut content = String::new();
@@ -484,12 +583,12 @@ mod tests {
 
         // Test error cases
         assert!(matches!(
-            BrushVfs::from_reader(Cursor::new(b"unknown")).await,
+            BrushVfs::from_reader(Cursor::new(b"unknown"), None).await,
             Err(VfsConstructError::UnknownDataType)
         ));
         assert!(matches!(
-            BrushVfs::from_reader(Cursor::new(b"<!DOCTYPE html>")).await,
-            Err(VfsConstructError::InvalidHtml(_))
+            BrushVfs::from_reader(Cursor::new(b"<!DOCTYPE html>"), None).await,
+            Err(VfsConstructError::ReceivedHTML(_))
         ));
     }
 }

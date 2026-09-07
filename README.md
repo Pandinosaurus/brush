@@ -27,6 +27,7 @@ Brush takes in COLMAP data or datasets in the Nerfstudio format. Training is ful
 It also supports masking images:
 - Images with transparency. This will force the final splat to match the transparency of the input.
 - A folder of images called 'masks'. This ignores parts of the image that are masked out.
+  Black pixels in the mask are ignored, white pixels are kept. Pass `--invert-masks` if your masks are the other way around.
 
 ## Viewer
 Brush also works well as a splat viewer, including on the web. It can load .ply & .compressed.ply files. You can stream in data from a URL (for a web app, simply append `?url=`).
@@ -46,12 +47,12 @@ While training, additional data can be visualized with the excellent [rerun](htt
 First install rust 1.88+. You can run tests with `cargo test --all`. Brush uses the wonderful [rerun](https://rerun.io/) for additional visualizations while training, run `cargo install rerun-cli` if you want to use it.
 
 ### Windows/macOS/Linux
-Simply `cargo run` or `cargo run --release` from the workspace root. Brush can also be used as a CLI, run `cargo run --release -- --help` to use the CLI directly from source. See the notes about the CLI in the features section.
+Use `cargo run --release` from the workspace root to make an optimized build. Use `cargo run` to run a debug build. 
 
 ### Web
-Brush can be compiled to WASM. Run `npm run dev` to start the demo website using Next.js, see the brush_nextjs directory.
+Brush can be compiled to WASM. Run `npm run dev` to start the demo website using Next.js, see the web directory in app/brush-app/web.
 
-Brush uses [`wasm-pack`](https://rustwasm.github.io/wasm-bindgen/introduction.html) to build the WASM bundle. You can also use it without a bundler, see [wasm-pack's documentation](hhttps://rustwasm.github.io/wasm-bindgen/examples/without-a-bundler.html).
+Brush uses [`wasm-pack`](https://drager.github.io/wasm-pack/) to build the WASM bundle. You can also use it without a bundler, see [wasm-pack's documentation](https://drager.github.io/wasm-pack/book/).
 
 WebGPU is still an upcoming standard, and as such, only Chrome 134+ on Windows and macOS is currently supported.
 

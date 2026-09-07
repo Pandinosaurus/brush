@@ -1,144 +1,180 @@
 use std::sync::Arc;
 
-use image::DynamicImage;
+use brush_async::Actor;
+use burn::tensor::TensorData;
 use rand::{SeedableRng, seq::SliceRandom};
-use tokio::sync::mpsc::Receiver;
-use tokio::sync::{RwLock, mpsc};
-use tokio_with_wasm::alias as tokio_wasm;
+use tokio::sync::{Mutex, mpsc};
 
-use crate::scene::{Scene, SceneBatch, sample_to_tensor_data, view_to_sample_image};
+use crate::{
+    config::LoadDatasetConfig,
+    scene::{Scene, SceneBatch, view_to_packed_data},
+};
+
+/// Shared cache of GPU-ready scene batches. Each slot holds at most one
+/// batch; once the running total passes `budget_bytes`, new batches bypass
+/// the cache and just get re-decoded + re-packed on every visit.
+///
+/// Caching the packed batch (instead of the decoded `DynamicImage`) skips
+/// the per-hit decode → premultiply → repack work. Cached buffers are put
+/// behind a refcount first (see `share_packed`), so a hit doesn't copy the
+/// pixels either: it hands out a view of the same allocation.
+struct BatchCache {
+    slots: Vec<Option<Arc<SceneBatch>>>,
+    used_bytes: u64,
+    budget_bytes: u64,
+}
+
+impl BatchCache {
+    fn new(n_views: usize, budget_bytes: u64) -> Self {
+        Self {
+            slots: vec![None; n_views],
+            used_bytes: 0,
+            budget_bytes,
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<Arc<SceneBatch>> {
+        self.slots[index].clone()
+    }
+
+    /// Whether `insert` would take this batch: nothing cached for the view
+    /// yet, and it still fits the budget. Checked before caching so the
+    /// packed bytes only get shared when they're actually going to be kept.
+    ///
+    /// Tracks exact bytes: rounding to whole MB let sub-MB images slip in
+    /// for free and bypass the budget entirely.
+    fn admits(&self, index: usize, batch: &SceneBatch) -> bool {
+        self.slots[index].is_none() && self.used_bytes + batch.packed_bytes() < self.budget_bytes
+    }
+
+    fn insert(&mut self, index: usize, batch: Arc<SceneBatch>) {
+        if !self.admits(index, &batch) {
+            return;
+        }
+        self.used_bytes += batch.packed_bytes();
+        self.slots[index] = Some(batch);
+    }
+}
 
 pub struct SceneLoader {
-    receiver: Receiver<SceneBatch>,
-
-    // We need to keep track of the spawned tasks such that they don't drop before we do.
-    _tasks: tokio_wasm::task::JoinSet<()>,
-}
-
-struct ImageCache {
-    states: Vec<Option<Arc<DynamicImage>>>,
-    max_size: usize,
-    size: usize,
-}
-
-// Cache at most some nr. of gigs of data.
-// TODO: Not sure if this should be configurable or not.
-#[cfg(not(target_family = "wasm"))]
-const MAX_CACHE_MB: usize = 6 * 1024;
-
-// On WASM, not much hope a big dataset will work anyway but let's not
-// cache more than what fits in memory.
-#[cfg(target_family = "wasm")]
-const MAX_CACHE_MB: usize = 2 * 1024;
-
-impl ImageCache {
-    fn new(max_size: usize, n_images: usize) -> Self {
-        Self {
-            states: vec![None; n_images],
-            max_size,
-            size: 0,
-        }
-    }
-
-    fn try_get(&self, index: usize) -> Option<Arc<DynamicImage>> {
-        self.states[index].clone()
-    }
-
-    fn insert(&mut self, index: usize, data: Arc<DynamicImage>) {
-        let data_size_mb = data.as_bytes().len() / (1024 * 1024);
-
-        if self.size + data_size_mb < self.max_size && self.states[index].is_none() {
-            self.states[index] = Some(data);
-            self.size += data_size_mb;
-        }
-    }
+    rx: mpsc::Receiver<SceneBatch>,
+    // Owns the loader actor threads. Dropping cancels them; their
+    // senders then drop, the channel closes, and `next_batch` returns.
+    _actors: Vec<Actor>,
 }
 
 impl SceneLoader {
-    pub fn new(scene: &Scene, seed: u64) -> Self {
-        // The bounded size == number of batches to prefetch.
-        let (send_batch, rec_batch) = mpsc::channel(2);
+    pub fn new(scene: &Scene, seed: u64, config: &LoadDatasetConfig) -> Self {
+        // Prefetch buffer: at most 4 batches ahead of the trainer.
+        // Two tasks per actor share this buffer so one task's I/O can
+        // overlap with the other's decode + GPU upload.
+        let (tx, rx) = mpsc::channel(4);
 
-        // On wasm, there is little point to spawning multiple of these. In theory there would be
-        // IF file reading truly was async, but since the zip archive is just in memory it isn't really
-        // any faster.
-        let parallelism = if cfg!(target_family = "wasm") {
+        // Fan out only as many loaders as we have real parallelism.
+        // Wasm shares one JS event loop, so extra actors just add
+        // contention without overlapping I/O.
+        let n_actors = if cfg!(target_family = "wasm") {
             1
         } else {
-            std::thread::available_parallelism()
-                .map(|x| x.get())
-                .unwrap_or(8)
+            std::thread::available_parallelism().map_or(8, |p| p.get())
         };
-        let num_views = scene.views.len();
+        const TASKS_PER_ACTOR: usize = 2;
 
-        let load_cache = Arc::new(RwLock::new(ImageCache::new(MAX_CACHE_MB, num_views)));
+        let views = scene.views.clone();
+        let cache = Arc::new(Mutex::new(BatchCache::new(
+            views.len(),
+            config.max_scene_batch_cache_size,
+        )));
 
-        let mut join_set = tokio_wasm::task::JoinSet::new();
-
-        for i in 0..parallelism {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed + i as u64);
-            let views = scene.views.clone();
-
-            let load_cache = load_cache.clone();
-            let send_batch = send_batch.clone();
-
-            join_set.spawn(async move {
-                let mut shuf_indices = vec![];
-
-                loop {
-                    let index = shuf_indices.pop().unwrap_or_else(|| {
-                        shuf_indices = (0..num_views).collect();
-                        shuf_indices.shuffle(&mut rng);
-                        shuf_indices
-                            .pop()
-                            .expect("Need at least one view in dataset")
-                    });
-
-                    let view = &views[index];
-
-                    let sample = if let Some(image) = load_cache.read().await.try_get(index) {
-                        image
-                    } else {
-                        let image = view
-                            .image
-                            .load()
-                            .await
-                            .expect("Scene loader encountered an error while loading an image");
-                        // Don't premultiply the image if it's a mask - treat as fully opaque.
-                        let sample = Arc::new(view_to_sample_image(image, view.image.alpha_mode()));
-                        load_cache.write().await.insert(index, sample.clone());
-                        sample
-                    };
-
-                    let img_tensor = sample_to_tensor_data(sample.as_ref().clone());
-
-                    if send_batch
-                        .send(SceneBatch {
-                            img_tensor,
-                            alpha_mode: view.image.alpha_mode(),
-                            camera: view.camera.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-
-                    tokio_wasm::task::yield_now().await;
+        let mut task_idx: u64 = 0;
+        let actors: Vec<Actor> = (0..n_actors)
+            .map(|i| {
+                let actor = Actor::new(&format!("dataloader-{i}"));
+                for _ in 0..TASKS_PER_ACTOR {
+                    let views = views.clone();
+                    let cache = cache.clone();
+                    let tx = tx.clone();
+                    let task_seed = seed.wrapping_add(task_idx);
+                    task_idx += 1;
+                    actor
+                        .run(move || run_loader(views, cache, tx, task_seed))
+                        .detach();
                 }
-            });
-        }
+                actor
+            })
+            .collect();
 
         Self {
-            receiver: rec_batch,
-            _tasks: join_set,
+            rx,
+            _actors: actors,
         }
     }
 
     pub async fn next_batch(&mut self) -> SceneBatch {
-        self.receiver
+        self.rx
             .recv()
             .await
-            .expect("Somehow lost data loading channel!")
+            .expect("Scene loader channel closed unexpectedly")
     }
+}
+
+async fn run_loader(
+    views: Arc<Vec<crate::scene::SceneView>>,
+    cache: Arc<Mutex<BatchCache>>,
+    tx: mpsc::Sender<SceneBatch>,
+    seed: u64,
+) {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut shuffled: Vec<usize> = Vec::new();
+
+    loop {
+        if shuffled.is_empty() {
+            shuffled = (0..views.len()).collect();
+            shuffled.shuffle(&mut rng);
+        }
+        let index = shuffled.pop().expect("Need at least one view in dataset");
+        let view = &views[index];
+
+        let cached = cache.lock().await.get(index);
+
+        let batch = if let Some(batch) = cached {
+            // The cached buffer is refcounted, so this is a pointer bump
+            // rather than a copy of the whole image.
+            batch.as_ref().clone()
+        } else {
+            let raw = view
+                .image
+                .load()
+                .await
+                .expect("Scene loader failed to load an image");
+            let (img_packed, has_alpha) = view_to_packed_data(raw, view.image.alpha_mode());
+            let mut batch = SceneBatch {
+                img_packed,
+                has_alpha,
+                alpha_mode: view.image.alpha_mode(),
+                camera: view.camera,
+            };
+
+            let mut cache = cache.lock().await;
+            if cache.admits(index, &batch) {
+                // Share the pixels before caching: this hand-off and every
+                // later hit then costs a refcount instead of a full copy.
+                batch.img_packed = share_packed(batch.img_packed);
+                cache.insert(index, Arc::new(batch.clone()));
+            }
+            batch
+        };
+
+        if tx.send(batch).await.is_err() {
+            break;
+        }
+        brush_async::yield_now().await;
+    }
+}
+
+/// Move the packed pixels behind a refcount, so cloning the batch out of the
+/// cache doesn't copy them. Uploading to the GPU is unaffected: that copies
+/// into a staging buffer either way.
+fn share_packed(data: TensorData) -> TensorData {
+    TensorData::from_bytes(data.bytes.shared(), data.shape, data.dtype)
 }

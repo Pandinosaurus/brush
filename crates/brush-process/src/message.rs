@@ -1,45 +1,30 @@
-use brush_dataset::Dataset;
-use brush_render::MainBackend;
-use brush_render::gaussian_splats::Splats;
-use brush_train::msg::{RefineStats, TrainStepStats};
-use glam::Vec3;
-use web_time::Duration;
+use std::path::PathBuf;
 
-pub enum ProcessMessage {
-    NewSource,
-    StartLoading {
-        training: bool,
+use brush_vfs::DataSource;
+use glam::Vec3;
+
+use crate::config::TrainStreamConfig;
+
+pub enum TrainMessage {
+    /// Training configuration - sent at the start of training.
+    TrainConfig {
+        config: Box<TrainStreamConfig>,
     },
-    /// Loaded a splat from a ply file.
-    ///
-    /// Nb: This includes all the intermediately loaded splats.
-    /// Nb: Animated splats will have the 'frame' number set.
-    ViewSplats {
-        up_axis: Option<Vec3>,
-        splats: Box<Splats<MainBackend>>,
-        frame: u32,
-        total_frames: u32,
-        progress: f32,
-    },
-    /// Loaded a bunch of viewpoints to train on.
+    /// Loaded a dataset to train on.
     Dataset {
-        dataset: Dataset,
+        dataset: brush_dataset::Dataset,
     },
-    /// Splat, or dataset and initial splat, are done loading.
-    #[allow(unused)]
-    DoneLoading,
     /// Some number of training steps are done.
     #[allow(unused)]
     TrainStep {
-        splats: Box<Splats<MainBackend>>,
-        stats: Box<TrainStepStats<MainBackend>>,
         iter: u32,
-        total_elapsed: Duration,
+        total_elapsed: web_time::Duration,
+        /// If in LOD phase: `(current_lod_1_based, total_lod_levels)`.
+        lod_progress: Option<(u32, u32)>,
     },
     /// Some number of training steps are done.
     #[allow(unused)]
     RefineStep {
-        stats: Box<RefineStats>,
         cur_splat_count: u32,
         iter: u32,
     },
@@ -50,9 +35,34 @@ pub enum ProcessMessage {
         avg_psnr: f32,
         avg_ssim: f32,
     },
+    DoneTraining,
+}
+
+pub enum ProcessMessage {
+    /// A new process is starting (before we know what type)
+    NewProcess,
+    /// Source has been loaded, contains the display name and type
+    StartLoading {
+        name: String,
+        source: DataSource,
+        training: bool,
+        /// The base directory path if available.
+        base_path: Option<PathBuf>,
+    },
+    /// Notification that splats have been updated.
+    SplatsUpdated {
+        up_axis: Option<Vec3>,
+        frame: u32,
+        total_frames: u32,
+        num_splats: u32,
+        sh_degree: u32,
+    },
+    TrainMessage(TrainMessage),
     /// Some warning occurred during the process, but the process can continue.
     Warning {
         error: anyhow::Error,
     },
-    DoneTraining,
+    /// Splat, or dataset and initial splat, are done loading.
+    #[allow(unused)]
+    DoneLoading,
 }

@@ -1,32 +1,42 @@
-use brush_dataset::config::{LoadDataseConfig, ModelConfig};
-use brush_train::config::TrainConfig;
 use clap::{Args, Parser};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Args)]
+#[derive(Clone, Args, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ProcessConfig {
     /// Random seed.
     #[arg(long, help_heading = "Process options", default_value = "42")]
     pub seed: u64,
-
     /// Iteration to resume from
     #[arg(long, help_heading = "Process options", default_value = "0")]
     pub start_iter: u32,
-
     /// Eval every this many steps.
-    #[arg(long, help_heading = "Process options", default_value = "1000")]
+    #[arg(
+        long,
+        help_heading = "Process options",
+        default_value = "1000",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub eval_every: u32,
     /// Save the rendered eval images to disk. Uses export-path for the file location.
     #[arg(long, help_heading = "Process options", default_value = "false")]
     pub eval_save_to_disk: bool,
-
     /// Export every this many steps.
-    #[arg(long, help_heading = "Process options", default_value = "5000")]
+    #[arg(
+        long,
+        help_heading = "Process options",
+        default_value = "5000",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub export_every: u32,
-    /// Location to put exported files. By default uses the data directory if available,
-    /// or the CWD otherwise.
-    ///
-    /// This path can be set as a relative path.
-    #[arg(long, help_heading = "Process options", default_value = "./")]
+    /// Location to put exported files. Supports {dataset} interpolation for the dataset
+    /// folder name. Path is relative to the dataset's parent directory (or CWD if unavailable).
+    /// Use "./{dataset}/" to export inside the dataset folder.
+    #[arg(
+        long,
+        help_heading = "Process options",
+        default_value = "./{dataset}_exports/"
+    )]
     pub export_path: String,
     /// Filename of exported ply file
     #[arg(
@@ -37,38 +47,28 @@ pub struct ProcessConfig {
     pub export_name: String,
 }
 
-#[derive(Parser, Clone)]
-pub struct ProcessArgs {
+#[derive(Parser, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TrainStreamConfig {
     #[clap(flatten)]
-    pub train_config: TrainConfig,
+    #[serde(flatten)]
+    pub train_config: brush_train::config::TrainConfig,
     #[clap(flatten)]
-    pub model_config: ModelConfig,
+    #[serde(flatten)]
+    pub model_config: brush_dataset::config::ModelConfig,
     #[clap(flatten)]
-    pub load_config: LoadDataseConfig,
+    #[serde(flatten)]
+    pub load_config: brush_dataset::config::LoadDatasetConfig,
     #[clap(flatten)]
+    #[serde(flatten)]
     pub process_config: ProcessConfig,
     #[clap(flatten)]
-    pub rerun_config: RerunConfig,
+    #[serde(flatten)]
+    pub rerun_config: brush_rerun::RerunConfig,
 }
 
-impl Default for ProcessArgs {
+impl Default for TrainStreamConfig {
     fn default() -> Self {
         Self::parse_from([""])
     }
-}
-
-#[derive(Clone, Args)]
-pub struct RerunConfig {
-    /// Whether to enable rerun.io logging for this run.
-    #[arg(long, help_heading = "Rerun options", default_value = "false")]
-    pub rerun_enabled: bool,
-    /// How often to log basic training statistics.
-    #[arg(long, help_heading = "Rerun options", default_value = "50")]
-    pub rerun_log_train_stats_every: u32,
-    /// How often to log out the full splat point cloud to rerun (warning: heavy).
-    #[arg(long, help_heading = "Rerun options")]
-    pub rerun_log_splats_every: Option<u32>,
-    /// The maximum size of images from the dataset logged to rerun.
-    #[arg(long, help_heading = "Rerun options", default_value = "512")]
-    pub rerun_max_img_size: u32,
 }
